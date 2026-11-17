@@ -1,0 +1,486 @@
+"use server";
+
+import { getCurrentUser } from "@/lib/auth";
+import { getPool, sql } from "@/lib/db";
+import { DEFAULT_POS_USER, getUnitHistory, getUnitTypes, getUnits, getUserUnits } from "@/lib/org/queries";
+import type { ActionResult, OrgUnitRow, UnitHistory, UnitPos, UserUnitRow } from "@/lib/org/types";
+
+// ทุก action เรียกได้ผ่าน POST ตรง ๆ — ตรวจ input ฝั่ง server เสมอ
+// ยังไม่มีระบบ login: by = NULL -> ใช้ SUSER_SNAME() ใน SQL (ส่ง by มาได้เมื่อมี auth)
+
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+class UserError extends Error {}
+
+function int(v: unknown, name: string): number {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n <= 0) throw new UserError(`ค่า ${name} ไม่ถูกต้อง`);
+  return n;
+}
+function optInt(v: unknown, name: string): number | null {
+  return v === null || v === undefined || v === "" ? null : int(v, name);
+}
+function date(v: unknown, name = "วันที่"): string {
+  if (typeof v !== "string" || !DATE_RE.test(v) || Number.isNaN(Date.parse(v))) throw new UserError(`${name} ไม่ถูกต้อง`);
+  return v;
+}
+function optDate(v: unknown, name: string): string | null {
+  return v === null || v === undefined || v === "" ? null : date(v, name);
+}
+function text(v: unknown, name: string, max: number, required = true): string | null {
+  const s = typeof v === "string" ? v.trim() : "";
+  if (!s) {
+    if (required) throw new UserError(`กรุณากรอก ${name}`);
+    return null;
+  }
+  if (s.length > max) throw new UserError(`${name} ยาวเกิน ${max} ตัวอักษร`);
+  return s;
+}
+function byOf(by: unknown): string | null {
+  return typeof by === "string" && by.trim() ? by.trim().slice(0, 50) : null;
+}
+
+// ข้อความจาก RAISERROR / trigger -> ข้อความที่ผู้ใช้อ่านเข้าใจ
+function friendly(err: unknown): string {
+  if (err instanceof UserError) return err.message;
+  const e = err as { message?: string; precedingErrors?: { message?: string }[]; originalError?: { info?: { message?: string } } };
+  const msgs = [
+    ...(e.precedingErrors ?? []).map((p) => p.message),
+    e.originalError?.info?.message,
+    e.message,
+  ].filter((m): m is string => Boolean(m) && !/transaction ended in the trigger/i.test(m!));
+  let msg = msgs.find((m) => /Org_|usp_/.test(m)) ?? msgs[0] ?? "เกิดข้อผิดพลาด กรุณาลองใหม่อีกครั้ง";
+  msg = msg.replace(/^(Org_Member|Org_Unit|usp_Org_\w+):\s*/, "");
+  if (msg.includes("ห้องนี้มีหัวหน้าอยู่แล้ว")) msg = "ห้องนี้มีหัวหน้าอยู่แล้วในช่วงวันที่เดียวกัน — ถอดหัวหน้าคนเดิมก่อน";
+  if (/UQ_Org_Unit_code/.test(msg)) msg = "รหัสห้องนี้มีอยู่แล้วในบริษัทนี้";
+  if (/CK_Org_Member_dates/.test(msg)) msg = "วันที่จบต้องไม่ก่อนวันที่เริ่ม";
+  if (/CK_Org_Unit_root/.test(msg)) msg = "ห้องระดับบริษัทต้องไม่มีห้องแม่ และห้องอื่นต้องมีห้องแม่";
+  if (/CK_Org_Unit_parent/.test(msg)) msg = "ห้องแม่เป็นตัวเองไม่ได้";
+  if (/CK_Org_Unit_type/.test(msg)) msg = "ประเภทห้องไม่ถูกต้อง";
+  if (/FK_Org_UnitPos_Unit/.test(msg)) msg = "ไม่พบห้อง — รีเฟรชหน้าแล้วลองใหม่";
+  if (/Invalid object name 'dbo\.Org_UnitPos'/.test(msg)) msg = "ยังไม่ได้สร้างตาราง Org_UnitPos — รัน db/002_org_unit_pos.sql ก่อน";
+  console.error("[org-units]", err);
+  return msg;
+}
+
+async function run<T>(fn: () => Promise<T | { data: T; note?: string | null }>): Promise<ActionResult<T>> {
+  try {
+    const r = await fn();
+    if (r && typeof r === "object" && "data" in (r as object) && "note" in (r as object)) {
+      const x = r as { data: T; note?: string | null };
+      return { ok: true, data: x.data, note: x.note ?? null };
+    }
+    return { ok: true, data: r as T };
+  } catch (err) {
+    return { ok: false, error: friendly(err) };
+  }
+}
+
+async function tx<T>(fn: (t: sql.Transaction) => Promise<T>): Promise<T> {
+  const pool = await getPool();
+  const t = new sql.Transaction(pool);
+  await t.begin();
+  try {
+    const r = await fn(t);
+    await t.commit();
+    return r;
+  } catch (err) {
+    // trigger อาจ rollback ไปแล้ว — rollback ซ้ำจะ throw ให้กลืนไว้
+    await t.rollback().catch(() => {});
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------- reads
+
+export async function refreshUnits(): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(() => getUnits());
+}
+
+export async function loadUnitHistory(unitId: number): Promise<ActionResult<UnitHistory>> {
+  return run(() => getUnitHistory(int(unitId, "Unit_ID")));
+}
+
+export async function loadUserUnits(userId: number): Promise<ActionResult<UserUnitRow[]>> {
+  return run(() => getUserUnits(int(userId, "UserID")));
+}
+
+// ---------------------------------------------------------------- Org_Unit
+
+export async function setParent(input: { unitId: number; parentId: number; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const unitId = int(input.unitId, "Unit_ID");
+    const parentId = int(input.parentId, "ห้องแม่");
+    if (unitId === parentId) throw new UserError("ห้องแม่เป็นตัวเองไม่ได้");
+    const pool = await getPool();
+    const chk = await pool.request().input("u", sql.Int, unitId).input("p", sql.Int, parentId).query(`
+      SELECT (SELECT unit_type FROM dbo.Org_Unit WHERE Unit_ID = @u AND Actived = 1) AS t,
+             (SELECT ComID FROM dbo.Org_Unit WHERE Unit_ID = @u) AS cu,
+             (SELECT ComID FROM dbo.Org_Unit WHERE Unit_ID = @p AND Actived = 1) AS cp`);
+    const c = chk.recordset[0];
+    if (!c.t || !c.cp) throw new UserError("ไม่พบห้อง (หรือถูกปิดแล้ว)");
+    if (c.t === "COMPANY") throw new UserError("ห้องระดับบริษัทไม่มีห้องแม่");
+    if (c.cu !== c.cp) throw new UserError("ห้องแม่ต้องอยู่บริษัทเดียวกัน");
+    await pool.request().input("u", sql.Int, unitId).input("p", sql.Int, parentId).input("by", sql.VarChar(50), byOf(input.by)).query(`
+      UPDATE dbo.Org_Unit SET parent_unit_id = @p, UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Unit_ID = @u`);
+    return getUnits();
+  });
+}
+
+type UnitInput = { unit_name?: string; unit_type?: string; by?: string };
+
+async function unitType(v: unknown): Promise<string> {
+  const types = await getUnitTypes();
+  if (typeof v !== "string" || v === "COMPANY" || !types.some((t) => t.unit_type === v)) throw new UserError("ประเภทห้องไม่ถูกต้อง");
+  return v;
+}
+
+/** ห้องระดับบริษัท (ราก) — 1 บริษัทมีได้ 1 ห้อง */
+export async function createCompanyUnit(input: { comId: number; unit_code: string; unit_name?: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const comId = int(input.comId, "บริษัท");
+    const code = text(input.unit_code, "รหัสห้อง", 40)!;
+    const name = text(input.unit_name, "ชื่อห้อง", 150, false);
+    const pool = await getPool();
+    const c = await pool.request().input("c", sql.Int, comId).input("code", sql.VarChar(40), code).query(`
+      SELECT (SELECT COUNT(*) FROM dbo.Company WHERE ComID = @c) AS com,
+             (SELECT COUNT(*) FROM dbo.Org_Unit WHERE ComID = @c AND unit_type = 'COMPANY' AND Actived = 1) AS roots,
+             (SELECT COUNT(*) FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code) AS dup`);
+    const r = c.recordset[0];
+    if (!r.com) throw new UserError("ไม่พบบริษัท");
+    if (r.roots) throw new UserError("บริษัทนี้มีห้องระดับบริษัทอยู่แล้ว");
+    if (r.dup) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+    await pool.request()
+      .input("c", sql.Int, comId).input("code", sql.VarChar(40), code).input("name", sql.NVarChar(150), name)
+      .input("by", sql.VarChar(50), byOf(input.by))
+      .query(`INSERT dbo.Org_Unit (ComID, unit_code, unit_type, unit_name, parent_unit_id, Actived, CreateBy)
+              VALUES (@c, @code, 'COMPANY', @name, NULL, 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50)))`);
+    return getUnits();
+  });
+}
+
+export async function createUnit(input: UnitInput & { parentId: number; unit_code: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const parentId = int(input.parentId, "ห้องแม่");
+    const code = text(input.unit_code, "รหัสห้อง", 40)!;
+    const name = text(input.unit_name, "ชื่อห้อง", 150, false);
+    const type = await unitType(input.unit_type);
+    const pool = await getPool();
+    const p = await pool.request().input("p", sql.Int, parentId).query(`SELECT ComID FROM dbo.Org_Unit WHERE Unit_ID = @p AND Actived = 1`);
+    if (!p.recordset.length) throw new UserError("ไม่พบห้องแม่ (หรือถูกปิดแล้ว)");
+    const comId = p.recordset[0].ComID as number;
+    const dup = await pool.request().input("c", sql.Int, comId).input("code", sql.VarChar(40), code)
+      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code`);
+    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+    await pool.request()
+      .input("c", sql.Int, comId).input("code", sql.VarChar(40), code).input("type", sql.VarChar(10), type)
+      .input("name", sql.NVarChar(150), name).input("p", sql.Int, parentId)
+      .input("by", sql.VarChar(50), byOf(input.by))
+      .query(`INSERT dbo.Org_Unit (ComID, unit_code, unit_type, unit_name, parent_unit_id, Actived, CreateBy)
+              VALUES (@c, @code, @type, @name, @p, 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50)))`);
+    return getUnits();
+  });
+}
+
+export async function updateUnit(input: UnitInput & { unitId: number; unit_code: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const unitId = int(input.unitId, "Unit_ID");
+    const code = text(input.unit_code, "รหัสห้อง", 40)!;
+    const name = text(input.unit_name, "ชื่อห้อง", 150, false);
+    const pool = await getPool();
+    const cur = await pool.request().input("u", sql.Int, unitId).query(`SELECT unit_type, ComID FROM dbo.Org_Unit WHERE Unit_ID = @u AND Actived = 1`);
+    if (!cur.recordset.length) throw new UserError("ไม่พบห้อง (หรือถูกปิดแล้ว)");
+    const dup = await pool.request().input("c", sql.Int, cur.recordset[0].ComID).input("code", sql.VarChar(40), code).input("u", sql.Int, unitId)
+      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code AND Unit_ID <> @u`);
+    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+    // ห้องบริษัทเปลี่ยนประเภทไม่ได้ และห้องอื่นเปลี่ยนเป็นบริษัทไม่ได้
+    const type = cur.recordset[0].unit_type === "COMPANY" ? "COMPANY" : await unitType(input.unit_type);
+    await pool.request()
+      .input("u", sql.Int, unitId).input("code", sql.VarChar(40), code).input("type", sql.VarChar(10), type).input("name", sql.NVarChar(150), name)
+      .input("by", sql.VarChar(50), byOf(input.by))
+      .query(`UPDATE dbo.Org_Unit SET unit_code = @code, unit_type = @type, unit_name = @name,
+                     UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+              WHERE Unit_ID = @u`);
+    return getUnits();
+  });
+}
+
+export async function deactivateUnit(input: { unitId: number; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const unitId = int(input.unitId, "Unit_ID");
+    const pool = await getPool();
+    const c = await pool.request().input("u", sql.Int, unitId).query(`
+      SELECT (SELECT COUNT(*) FROM dbo.Org_Member WHERE Unit_ID = @u AND Actived = 1
+                AND (end_date IS NULL OR end_date >= CAST(GETDATE() AS date))) AS members,
+             (SELECT COUNT(*) FROM dbo.Org_Unit WHERE parent_unit_id = @u AND Actived = 1) AS children,
+             (SELECT unit_type FROM dbo.Org_Unit WHERE Unit_ID = @u) AS t`);
+    const r = c.recordset[0];
+    if (r.t === "COMPANY") throw new UserError("ปิดห้องระดับบริษัทไม่ได้");
+    if (r.members > 0) throw new UserError(`ยังมีคนในห้องนี้ ${r.members} รายการ (รวมที่ตั้งไว้ล่วงหน้า) — ย้ายหรือให้ออกก่อน`);
+    if (r.children > 0) throw new UserError(`ยังมีห้องลูก ${r.children} ห้อง — ย้ายห้องลูกก่อน`);
+    await pool.request().input("u", sql.Int, unitId).input("by", sql.VarChar(50), byOf(input.by)).query(`
+      UPDATE dbo.Org_Unit SET Actived = 0, UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Unit_ID = @u`);
+    return getUnits();
+  });
+}
+
+// ---------------------------------------------------------------- Org_UnitPos (ตำแหน่ง node)
+// UserID มาจาก getCurrentUser() ฝั่ง server เท่านั้น — ไม่รับจาก client · ไม่ login = บันทึกไม่ได้
+
+const MAX_POS_ROWS = 5000;
+const POS_CHUNK = 500; // 3 parameter ต่อแถว — อยู่ใต้ลิมิต 2100 parameter ของ SQL Server
+
+function coord(v: unknown, name: string): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || Math.abs(n) > 1e7) throw new UserError(`ค่า ${name} ไม่ถูกต้อง`);
+  return Math.round(n * 100) / 100;
+}
+
+async function requireUser() {
+  const user = await getCurrentUser();
+  if (!user) throw new UserError("ยังไม่ได้ login — ไม่ได้บันทึกตำแหน่ง");
+  return user;
+}
+
+/** บันทึก / อัปเดตตำแหน่งของผังตัวเอง (upsert เฉพาะแถวที่ส่งมา) */
+export async function saveUnitPositions(input: { rows: UnitPos[] }): Promise<ActionResult<null>> {
+  return run(async () => {
+    const user = await requireUser();
+    if (!Array.isArray(input?.rows) || input.rows.length > MAX_POS_ROWS) throw new UserError("ข้อมูลตำแหน่งไม่ถูกต้อง");
+    // id ซ้ำ -> ใช้ค่าหลังสุด (MERGE ห้ามมีแถวต้นทางซ้ำ)
+    const byUnit = new Map<number, { id: number; x: number; y: number }>();
+    input.rows.forEach((r) => {
+      const id = int(r?.Unit_ID, "Unit_ID");
+      byUnit.set(id, { id, x: coord(r?.x, "x"), y: coord(r?.y, "y") });
+    });
+    const rows = [...byUnit.values()];
+    if (!rows.length) return null;
+    await tx(async (t) => {
+      for (let i = 0; i < rows.length; i += POS_CHUNK) {
+        const chunk = rows.slice(i, i + POS_CHUNK);
+        const req = new sql.Request(t).input("uid", sql.BigInt, user.UserID);
+        const values = chunk.map((r, j) => {
+          req.input(`u${j}`, sql.Int, r.id).input(`x${j}`, sql.Float, r.x).input(`y${j}`, sql.Float, r.y);
+          return `(@u${j}, @x${j}, @y${j})`;
+        });
+        await req.query(`
+          MERGE dbo.Org_UnitPos AS t
+          USING (VALUES ${values.join(", ")}) AS s (Unit_ID, pos_x, pos_y)
+          ON t.UserID = @uid AND t.Unit_ID = s.Unit_ID
+          WHEN MATCHED THEN UPDATE SET pos_x = s.pos_x, pos_y = s.pos_y, UpdateDate = GETDATE()
+          WHEN NOT MATCHED THEN INSERT (UserID, Unit_ID, pos_x, pos_y) VALUES (@uid, s.Unit_ID, s.pos_x, s.pos_y);`);
+      }
+    });
+    return null;
+  });
+}
+
+/** ตั้งผังของตัวเองเป็นผังกลาง (UserID 0) — แทนที่ผังกลางเดิมทั้งชุด */
+export async function publishDefaultLayout(): Promise<ActionResult<null>> {
+  return run(async () => {
+    const user = await requireUser();
+    await tx(async (t) => {
+      const r = await new sql.Request(t).input("uid", sql.BigInt, user.UserID).input("def", sql.BigInt, DEFAULT_POS_USER).query(`
+        DELETE dbo.Org_UnitPos WHERE UserID = @def;
+        INSERT dbo.Org_UnitPos (UserID, Unit_ID, pos_x, pos_y)
+        SELECT @def, Unit_ID, pos_x, pos_y FROM dbo.Org_UnitPos WHERE UserID = @uid;`);
+      if (!r.rowsAffected.at(-1)) throw new UserError("ยังไม่มีผังของคุณ — ลากหรือจัดเรียงใหม่ก่อน");
+    });
+    return null;
+  });
+}
+
+// ---------------------------------------------------------------- Org_Member
+// ทุก action ของสมาชิกคืน units ใหม่ (จำนวนคน / หัวหน้าบน node เปลี่ยน) — dialog โหลดรายชื่อใหม่เอง
+
+export async function addMember(input: {
+  unitId: number; userId: number; positionId: number; isManager: boolean; date: string; by?: string;
+}): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const unitId = int(input.unitId, "Unit_ID");
+    const userId = int(input.userId, "ผู้ใช้");
+    const positionId = int(input.positionId, "ตำแหน่ง");
+    const d = date(input.date);
+    let note: string | null = null;
+    await tx(async (t) => {
+      // ยังไม่มีห้องหลักตั้งแต่วันที่มีผลเป็นต้นไป -> ห้องนี้เป็นห้องหลัก
+      const p = await new sql.Request(t).input("uid", sql.BigInt, userId).input("d", sql.VarChar(10), d).query(`
+        SELECT COUNT(*) AS n FROM dbo.Org_Member
+        WHERE UserID = @uid AND Actived = 1 AND is_primary = 1
+          AND (end_date IS NULL OR end_date >= CAST(@d AS date))`);
+      const isPrimary = p.recordset[0].n === 0;
+      if (isPrimary) note = "ตั้งเป็นห้องหลักให้อัตโนมัติ (ยังไม่มีห้องหลัก)";
+      await new sql.Request(t)
+        .input("unit", sql.Int, unitId).input("uid", sql.BigInt, userId).input("pos", sql.Int, positionId)
+        .input("mgr", sql.Bit, Boolean(input.isManager)).input("pri", sql.Bit, isPrimary)
+        .input("d", sql.VarChar(10), d).input("by", sql.VarChar(50), byOf(input.by))
+        .query(`INSERT dbo.Org_Member (Unit_ID, UserID, PositionID, is_manager, is_primary, start_date, end_date, Actived, CreateBy)
+                VALUES (@unit, @uid, @pos, @mgr, @pri, CAST(@d AS date), NULL, 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50)))`);
+    });
+    return { data: await getUnits(), note };
+  });
+}
+
+export async function moveMember(input: {
+  memberId: number; toUnitId: number; positionId?: number | null; isManager: boolean; date: string; by?: string;
+}): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const pool = await getPool();
+    const r = await pool.request()
+      .input("member_id", sql.Int, int(input.memberId, "Member_ID"))
+      .input("to_unit_id", sql.Int, int(input.toUnitId, "ห้องปลายทาง"))
+      .input("effective_date", sql.Date, new Date(`${date(input.date)}T00:00:00Z`))
+      .input("position_id", sql.Int, optInt(input.positionId, "ตำแหน่ง"))
+      .input("is_manager", sql.Bit, Boolean(input.isManager))
+      .input("by", sql.VarChar(50), byOf(input.by))
+      .execute("dbo.usp_Org_MoveMember");
+    const rows = (r.recordset ?? []) as { note?: string | null }[];
+    const note = rows.find((x) => x.note)?.note ?? null;
+    return { data: await getUnits(), note };
+  });
+}
+
+export async function setPrimary(input: { memberId: number; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const pool = await getPool();
+    await pool.request()
+      .input("member_id", sql.Int, int(input.memberId, "Member_ID"))
+      .input("effective_date", sql.Date, new Date(`${date(input.date)}T00:00:00Z`))
+      .input("by", sql.VarChar(50), byOf(input.by))
+      .execute("dbo.usp_Org_SetPrimary");
+    return getUnits();
+  });
+}
+
+/** ตั้ง / ถอดหัวหน้า 1 แถวภายใน transaction — แบ่งแถวตามวันที่: แถวเดิมจบ d-1 · แถวใหม่เริ่ม d ถึง end เดิม (ถ้าแถวเริ่มก่อน d) */
+async function applyManager(t: sql.Transaction, memberId: number, isManager: boolean, d: string, by: string | null) {
+  const cur = await new sql.Request(t).input("m", sql.Int, memberId).query(`
+    SELECT m.Unit_ID, m.is_manager, m.Actived, un.unit_code,
+           CONVERT(varchar(10), m.start_date, 23) AS start_date,
+           CONVERT(varchar(10), m.end_date, 23) AS end_date
+    FROM dbo.Org_Member m WITH (UPDLOCK)
+    JOIN dbo.Org_Unit un ON un.Unit_ID = m.Unit_ID
+    WHERE m.Member_ID = @m`);
+  const row = cur.recordset[0] as {
+    Unit_ID: number; is_manager: boolean; Actived: boolean; unit_code: string; start_date: string | null; end_date: string | null;
+  } | undefined;
+  if (!row || !row.Actived) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
+  if ((row.start_date && row.start_date > d) || (row.end_date && row.end_date < d))
+    throw new UserError("วันที่มีผลไม่อยู่ในช่วงวันที่ของรายการนี้");
+  if (Boolean(row.is_manager) === isManager)
+    throw new UserError(isManager ? "คนนี้เป็นหัวหน้าห้องนี้อยู่แล้ว" : "คนนี้ไม่ได้เป็นหัวหน้าห้องนี้");
+
+  const req = () => new sql.Request(t)
+    .input("m", sql.Int, memberId).input("mgr", sql.Bit, isManager)
+    .input("d", sql.VarChar(10), d).input("end", sql.VarChar(10), row.end_date).input("by", sql.VarChar(50), by);
+  if (!row.start_date || row.start_date < d) {
+    await req().query(`
+      UPDATE dbo.Org_Member SET end_date = DATEADD(DAY, -1, CAST(@d AS date)),
+             UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Member_ID = @m;
+      INSERT dbo.Org_Member (Unit_ID, UserID, PositionID, is_manager, is_primary, start_date, end_date, Actived, CreateBy)
+      SELECT Unit_ID, UserID, PositionID, @mgr, is_primary, CAST(@d AS date), CAST(@end AS date), 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50))
+      FROM dbo.Org_Member WHERE Member_ID = @m;`);
+  } else {
+    await req().query(`
+      UPDATE dbo.Org_Member SET is_manager = @mgr,
+             UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Member_ID = @m`);
+  }
+  return row;
+}
+
+export async function setManager(input: { memberId: number; isManager: boolean; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const memberId = int(input.memberId, "Member_ID");
+    const isManager = Boolean(input.isManager);
+    const d = date(input.date);
+    let note: string | null = null;
+    await tx(async (t) => {
+      const row = await applyManager(t, memberId, isManager, d, byOf(input.by));
+      if (!isManager) note = `ห้อง ${row.unit_code} จะไม่มีหัวหน้าตั้งแต่ ${d} (สายอนุมัติจะขึ้นไปห้องแม่)`;
+    });
+    return { data: await getUnits(), note };
+  });
+}
+
+/** เปลี่ยนหัวหน้า (ลากวาง): ถอดหัวหน้าเดิม ณ วันที่ d แล้วตั้งคนใหม่ — transaction เดียว ไม่มีช่วงว่าง/ซ้อน */
+export async function replaceManager(input: { memberId: number; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const memberId = int(input.memberId, "Member_ID");
+    const d = date(input.date);
+    const by = byOf(input.by);
+    await tx(async (t) => {
+      const u = await new sql.Request(t).input("m", sql.Int, memberId).query(`
+        SELECT Unit_ID FROM dbo.Org_Member WHERE Member_ID = @m AND Actived = 1`);
+      const unitId = u.recordset[0]?.Unit_ID as number | undefined;
+      if (unitId == null) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
+      // หัวหน้าที่คลุมวันที่ d (ไม่นับตัวเอง) -> ถอดก่อน แล้วค่อยตั้งคนใหม่ (trigger ห้ามหัวหน้าซ้อน)
+      const olds = await new sql.Request(t).input("u", sql.Int, unitId).input("m", sql.Int, memberId).input("d", sql.VarChar(10), d).query(`
+        SELECT Member_ID FROM dbo.Org_Member WITH (UPDLOCK)
+        WHERE Unit_ID = @u AND Actived = 1 AND is_manager = 1 AND Member_ID <> @m
+          AND (start_date IS NULL OR start_date <= CAST(@d AS date))
+          AND (end_date IS NULL OR end_date >= CAST(@d AS date))`);
+      for (const o of olds.recordset as { Member_ID: number }[]) await applyManager(t, o.Member_ID, false, d, by);
+      await applyManager(t, memberId, true, d, by);
+    });
+    return getUnits();
+  });
+}
+
+/** ให้ออกจากห้องนี้: end_date = วันสุดท้ายที่อยู่ */
+export async function endMember(input: { memberId: number; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const memberId = int(input.memberId, "Member_ID");
+    const d = date(input.date);
+    const pool = await getPool();
+    const cur = await pool.request().input("m", sql.Int, memberId).query(`
+      SELECT m.Actived, m.is_manager, un.unit_code,
+             CONVERT(varchar(10), m.start_date, 23) AS start_date, CONVERT(varchar(10), m.end_date, 23) AS end_date
+      FROM dbo.Org_Member m JOIN dbo.Org_Unit un ON un.Unit_ID = m.Unit_ID WHERE m.Member_ID = @m`);
+    const row = cur.recordset[0];
+    if (!row || !row.Actived) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
+    if (row.start_date && row.start_date > d) throw new UserError("วันสุดท้ายต้องไม่ก่อนวันที่เริ่ม — ถ้าสร้างผิดให้ใช้ \"ยกเลิกรายการ\"");
+    if (row.end_date && row.end_date <= d) throw new UserError(`รายการนี้จบวันที่ ${row.end_date} อยู่แล้ว`);
+    await pool.request().input("m", sql.Int, memberId).input("d", sql.VarChar(10), d).input("by", sql.VarChar(50), byOf(input.by)).query(`
+      UPDATE dbo.Org_Member SET end_date = CAST(@d AS date),
+             UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Member_ID = @m`);
+    const note = row.is_manager ? `ห้อง ${row.unit_code} จะไม่มีหัวหน้าหลังวันที่ ${d}` : null;
+    return { data: await getUnits(), note };
+  });
+}
+
+/** แก้ข้อมูลที่กรอกผิดตรง ๆ (ไม่แบ่งแถว) */
+export async function editMember(input: {
+  memberId: number; positionId: number; startDate: string | null; endDate: string | null; by?: string;
+}): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const s = optDate(input.startDate, "วันที่เริ่ม");
+    const e = optDate(input.endDate, "วันที่จบ");
+    if (s && e && e < s) throw new UserError("วันที่จบต้องไม่ก่อนวันที่เริ่ม");
+    const pool = await getPool();
+    const r = await pool.request()
+      .input("m", sql.Int, int(input.memberId, "Member_ID")).input("pos", sql.Int, int(input.positionId, "ตำแหน่ง"))
+      .input("s", sql.VarChar(10), s).input("e", sql.VarChar(10), e).input("by", sql.VarChar(50), byOf(input.by))
+      .query(`UPDATE dbo.Org_Member SET PositionID = @pos, start_date = CAST(@s AS date), end_date = CAST(@e AS date),
+                     UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+              WHERE Member_ID = @m AND Actived = 1`);
+    if (!r.rowsAffected[0]) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
+    return getUnits();
+  });
+}
+
+/** ยกเลิกรายการที่สร้างผิด (Actived = 0) — ไม่ลบแถว */
+export async function cancelMember(input: { memberId: number; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const pool = await getPool();
+    const r = await pool.request().input("m", sql.Int, int(input.memberId, "Member_ID")).input("by", sql.VarChar(50), byOf(input.by)).query(`
+      UPDATE dbo.Org_Member SET Actived = 0, UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Member_ID = @m AND Actived = 1`);
+    if (!r.rowsAffected[0]) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
+    return getUnits();
+  });
+}
