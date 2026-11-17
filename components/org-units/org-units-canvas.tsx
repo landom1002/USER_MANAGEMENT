@@ -518,7 +518,7 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
   const openAddChild = useCallback((u: OrgUnitRow) => setUnitForm({ mode: "create", parent: u }), []);
 
   return (
-    <div className="fixed inset-x-0 top-0 bottom-0 z-40 md:top-12">
+    <div className="relative h-[calc(100svh-var(--header-height))] w-full">
       <AddChildContext.Provider value={openAddChild}>
       <ReactFlow
         nodes={rfNodes}

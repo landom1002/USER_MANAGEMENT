@@ -11,7 +11,7 @@ export default function OrgUnitsPage() {
   return (
     <Suspense
       fallback={
-        <div className="flex h-[calc(100svh-3rem)] items-center justify-center gap-2 text-sm text-muted-foreground">
+        <div className="flex h-[calc(100svh-var(--header-height))] items-center justify-center gap-2 text-sm text-muted-foreground">
           <Loader2 className="size-4 animate-spin" /> กำลังโหลดผังองค์กร...
         </div>
       }

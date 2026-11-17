@@ -1,34 +1,20 @@
-import Link from "next/link";
-import { Network } from "lucide-react";
+import { AppSidebar } from "@/components/app-sidebar";
+import { SiteHeader } from "@/components/site-header";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 
-const NAV = [
-  { href: "/c/admin/org-units", label: "ผังห้อง (Org Units)" },
-];
-
-// header สูง 48px (h-12) ให้ตรงกับหน้า canvas ที่วางไว้ที่ md:top-12
+// โครงตาม shadcn sidebar-16 — header สูง --header-height (3.5rem)
+// หน้า canvas ใช้ค่านี้คำนวณความสูงตัวเอง
 export default function ContentLayout({ children }: { children: React.ReactNode }) {
   return (
-    <div className="min-h-svh bg-background">
-      <header className="sticky top-0 z-50 hidden h-12 items-center gap-4 border-b bg-background px-4 md:flex">
-        <Link href="/c/admin/org-units" className="flex items-center gap-2 font-semibold">
-          <span className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Network className="size-4" />
-          </span>
-          <span className="text-sm">OPS Hierarchy</span>
-        </Link>
-        <nav className="flex items-center gap-1">
-          {NAV.map((n) => (
-            <Link
-              key={n.href}
-              href={n.href}
-              className="rounded-md px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-            >
-              {n.label}
-            </Link>
-          ))}
-        </nav>
-      </header>
-      <main>{children}</main>
+    <div className="[--header-height:calc(--spacing(14))]">
+      {/* defaultOpen={false} = เปิดหน้ามา sidebar ยุบไว้ กดปุ่ม ☰ ใน header เพื่อเปิด */}
+      <SidebarProvider defaultOpen={false} className="flex flex-col">
+        <SiteHeader />
+        <div className="flex flex-1">
+          <AppSidebar />
+          <SidebarInset className="min-w-0">{children}</SidebarInset>
+        </div>
+      </SidebarProvider>
     </div>
   );
 }
