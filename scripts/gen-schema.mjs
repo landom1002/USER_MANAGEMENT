@@ -1,14 +1,14 @@
 // สร้าง schema.md จาก DB จริง — อ่าน sys.* อย่างเดียว ไม่แก้อะไรใน DB
 // ใช้ค่าเชื่อมต่อจาก .env (DB_SERVER / DB_USER / DB_PASSWORD / DB_NAME_USERSRIGHT)
-// usage: node scripts/gen-schema.mjs            -> เขียนทับ schema.md
-//        node scripts/gen-schema.mjs out.md     -> เขียนไฟล์อื่น
+// usage: npm run dump:schema                  -> เขียนทับ db/schema.md
+//        npm run dump:schema -- out.md         -> เขียนไฟล์อื่น (path จาก root โปรเจกต์)
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import sql from "mssql";
 
 const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const outFile = path.resolve(projectDir, process.argv[2] ?? "schema.md");
+const outFile = path.resolve(projectDir, process.argv[2] ?? "db/schema.md");
 
 /** โน้ตเขียนมือ (ไม่มีใน DB) — แสดงใต้บรรทัด Type ของตาราง / ช่อง Description ของคอลัมน์ */
 const NOTES = {
