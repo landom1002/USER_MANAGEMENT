@@ -1,16 +1,17 @@
 "use client";
 
 import {
-  ArrowRight, ArrowRightFromLine, ArrowRightToLine, Ban, Briefcase, Building2, CalendarPlus, Crown, GitBranch, LogOut,
-  Network, Pencil, PencilLine, Power, Star, StarOff, UserPlus, UserX, type LucideIcon,
+  ArrowRight, ArrowRightFromLine, ArrowRightToLine, Ban, Briefcase, Building2, CalendarPlus, CalendarRange, Crown, GitBranch, LogOut,
+  Merge, Network, Pencil, PencilLine, Power, RotateCcw, Star, StarOff, UserPlus, UserX, type LucideIcon,
 } from "lucide-react";
-import { CATS, EVENT_TYPES, eventTone, fmt, fmtStamp, type EventCat, type EventType, type UnitEvent } from "@/lib/org/history";
+import { CATS, catTone, EVENT_TYPES, eventTone, fmt, fmtStamp, type EventCat, type EventType, type UnitEvent } from "@/lib/org/history";
 import { cn } from "@/lib/utils";
 
 const ICONS: Record<EventType, LucideIcon> = {
   in: UserPlus, future: CalendarPlus, movein: ArrowRightToLine, moveout: ArrowRightFromLine, out: LogOut, position: Briefcase,
   mgr: Crown, unmgr: UserX, primary: Star, unprimary: StarOff,
-  ucreate: Building2, uedit: Pencil, uclose: Power, parent: GitBranch, child: Network,
+  ucreate: Building2, uedit: Pencil, uclose: Power, uopen: RotateCcw, parent: GitBranch, child: Network,
+  extend: CalendarRange, merge: Merge, mgrextend: CalendarRange, mgrmerge: Merge,
   edit: PencilLine, cancel: Ban,
 };
 
@@ -45,7 +46,7 @@ export function UnitHistoryLog({ events, cat, onCat, period, today, onPick }: {
 
   const chips: [CatFilter, string, string][] = [
     ["all", "ทั้งหมด", "var(--foreground)"],
-    ...(Object.keys(CATS) as EventCat[]).map((k): [CatFilter, string, string] => [k, CATS[k].label, eventToneOfCat(k)]),
+    ...(Object.keys(CATS) as EventCat[]).map((k): [CatFilter, string, string] => [k, CATS[k].label, catTone(k).solid]),
   ];
 
   return (
@@ -138,5 +139,3 @@ export function UnitHistoryLog({ events, cat, onCat, period, today, onPick }: {
     </div>
   );
 }
-
-const eventToneOfCat = (k: EventCat) => `oklch(0.62 ${CATS[k].chroma} ${CATS[k].hue})`;

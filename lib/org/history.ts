@@ -149,7 +149,8 @@ export type EventCat = "member" | "mgr" | "primary" | "unit" | "fix";
 export type EventType =
   | "in" | "future" | "movein" | "moveout" | "out" | "position"
   | "mgr" | "unmgr" | "primary" | "unprimary"
-  | "ucreate" | "uedit" | "uclose" | "parent" | "child"
+  | "ucreate" | "uedit" | "uclose" | "uopen" | "parent" | "child"
+  | "extend" | "merge" | "mgrextend" | "mgrmerge"
   | "edit" | "cancel";
 
 export const CATS: Record<EventCat, { label: string; hue: number; chroma: number }> = {
@@ -160,30 +161,34 @@ export const CATS: Record<EventCat, { label: string; hue: number; chroma: number
   fix: { label: "แก้ไข / ยกเลิก", hue: 286, chroma: 0 },
 };
 
-export const EVENT_TYPES: Record<EventType, { label: string; cat: EventCat; hue?: number }> = {
+export const EVENT_TYPES: Record<EventType, { label: string; cat: EventCat }> = {
   in: { label: "เข้าห้อง", cat: "member" },
   future: { label: "จะเข้าห้อง (ล่วงหน้า)", cat: "member" },
   movein: { label: "ย้ายเข้ามา", cat: "member" },
-  moveout: { label: "ย้ายออกไปห้องอื่น", cat: "member", hue: 27 },
-  out: { label: "ออกจากห้อง", cat: "member", hue: 27 },
+  moveout: { label: "ย้ายออกไปห้องอื่น", cat: "member" },
+  out: { label: "ออกจากห้อง", cat: "member" },
   position: { label: "เปลี่ยนตำแหน่ง", cat: "member" },
+  extend: { label: "ขยายช่วงวันที่ (ต่อกับรายการเดิม)", cat: "member" },
+  merge: { label: "รวมรายการที่ต่อกัน", cat: "member" },
   mgr: { label: "ตั้งเป็นหัวหน้า", cat: "mgr" },
   unmgr: { label: "ถอดหัวหน้า / พ้นหัวหน้า", cat: "mgr" },
+  mgrextend: { label: "ขยายช่วงหัวหน้า (ต่อกับรายการเดิม)", cat: "mgr" },
+  mgrmerge: { label: "รวมช่วงหัวหน้าที่ต่อกัน", cat: "mgr" },
   primary: { label: "ตั้งเป็นห้องหลัก", cat: "primary" },
   unprimary: { label: "ห้องหลักย้ายไปห้องอื่น", cat: "primary" },
   ucreate: { label: "สร้างห้อง", cat: "unit" },
   uedit: { label: "แก้ไขข้อมูลห้อง", cat: "unit" },
   uclose: { label: "ปิดห้อง", cat: "unit" },
+  uopen: { label: "เปิดห้องกลับ", cat: "unit" },
   parent: { label: "เปลี่ยนห้องแม่", cat: "unit" },
   child: { label: "เพิ่มห้องลูก", cat: "unit" },
   edit: { label: "แก้ไขข้อมูล (กรอกผิด)", cat: "fix" },
   cancel: { label: "ยกเลิกรายการ", cat: "fix" },
 };
 
-export const eventTone = (t: EventType) => {
-  const c = CATS[EVENT_TYPES[t].cat];
-  return hueTone(EVENT_TYPES[t].hue ?? c.hue, EVENT_TYPES[t].hue ? 0.17 : c.chroma);
-};
+/** สีของเหตุการณ์ = สีของกลุ่ม (ตรงกับจุดสีบนปุ่มกรองกลุ่ม) */
+export const catTone = (k: EventCat) => hueTone(CATS[k].hue, CATS[k].chroma);
+export const eventTone = (t: EventType) => catTone(EVENT_TYPES[t].cat);
 
 export type Diff = { field: string; old: string; new: string };
 
@@ -315,6 +320,22 @@ function logEvents(rows: OrgMemberHistRow[], log: OrgLogRow[], { unitId, units, 
     id === null || id === undefined ? "-" : opts.find((o) => o.value === str(id))?.label ?? `#${str(id)}`;
   const typeName = (t: unknown) => lookups.unitTypes.find((x) => x.unit_type === t)?.name_th ?? (str(t) || "-");
 
+  // log ของ Org_Member ที่บันทึกใน transaction เดียวกัน (Log_ID ติดกัน) ของคนเดียวกันในห้องเดียวกัน
+  const memberLogs = log
+    .filter((l) => l.table_name === "Org_Member" && l.action === "U")
+    .map((l) => ({ l, o: parse(l.old_json), n: parse(l.new_json) }));
+  const sibling = (l: OrgLogRow, o: Json, pred: (o2: Json, n2: Json) => boolean) =>
+    memberLogs.find(
+      (x) => x.l.row_id !== l.row_id && Math.abs(x.l.Log_ID - l.Log_ID) <= 3 && x.o && x.n
+        && str(x.n.UserID) === str(o.UserID) && str(x.n.Unit_ID) === str(o.Unit_ID) && pred(x.o, x.n),
+    );
+  const day = (v: unknown) => str(v).slice(0, 10) || null;
+  /** ช่วงของ a คลุมช่วงของ b ทั้งหมด (null = ไม่มีขอบ) */
+  const covers = (a: Json, b: Json) => {
+    const as = day(a.start_date), ae = day(a.end_date), bs = day(b.start_date), be = day(b.end_date);
+    return (!as || (Boolean(bs) && as <= bs!)) && (!ae || (Boolean(be) && ae >= be!));
+  };
+
   for (const l of log) {
     const o = parse(l.old_json);
     const n = parse(l.new_json);
@@ -337,6 +358,10 @@ function logEvents(rows: OrgMemberHistRow[], log: OrgLogRow[], { unitId, units, 
       const name = `${str(n.unit_code)}`;
       if (o.Actived && !n.Actived) {
         ev.push({ key: `log${l.Log_ID}`, date, type: "uclose", name, sub: "ปิดห้อง (Actived = 0)", ...meta, diffs: [] });
+        continue;
+      }
+      if (!o.Actived && n.Actived) {
+        ev.push({ key: `log${l.Log_ID}`, date, type: "uopen", name, sub: "เปิดห้องกลับ (Actived = 1)", ...meta, diffs: [] });
         continue;
       }
       if (str(o.parent_unit_id) !== str(n.parent_unit_id)) {
@@ -362,6 +387,16 @@ function logEvents(rows: OrgMemberHistRow[], log: OrgLogRow[], { unitId, units, 
     const who = r ? r.Name ?? r.UserCode : `Member #${l.row_id}`;
     const code = r?.UserCode ?? "";
     if (o.Actived && !n.Actived) {
+      // รวมแถว: แถวนี้ถูกปิด + อีกแถวของคนเดียวกันขยายช่วงมาคลุมช่วงของแถวนี้ (เดิมไม่คลุม)
+      const into = sibling(l, o, (o2, n2) => Boolean(n2.Actived) && covers(n2, o) && !covers(o2, o));
+      if (into) {
+        ev.push({
+          key: `log${l.Log_ID}`, date, type: into.n!.is_manager ? "mgrmerge" : "merge", name: who, ...meta,
+          sub: `${code} · รวมเป็นรายการเดียว ${fmtRange(day(into.n!.start_date), day(into.n!.end_date))}`,
+          diffs: [{ field: "วันที่จบ", old: dateVal(into.o!.end_date), new: dateVal(into.n!.end_date) }],
+        });
+        continue;
+      }
       ev.push({
         key: `log${l.Log_ID}`, date, type: "cancel", name: who, struck: true, ...meta, diffs: [],
         sub: `${code} · ${r ? posLabel(r) : ""} · ${fmtRange(str(o.start_date).slice(0, 10) || null, str(o.end_date).slice(0, 10) || null)}`,
@@ -378,7 +413,43 @@ function logEvents(rows: OrgMemberHistRow[], log: OrgLogRow[], { unitId, units, 
         sub: on ? `${code} · ${r ? posLabel(r) : ""}` : `${code} · ยังอยู่ในห้องต่อ`,
       });
     }
-    if (str(o.PositionID) === str(n.PositionID) && str(o.start_date) === str(n.start_date)) continue;
+    if (str(o.PositionID) === str(n.PositionID) && str(o.start_date) === str(n.start_date)) {
+      // ขยายวันจบให้ยาวขึ้นอย่างเดียว = ต่อช่วงเข้ากับรายการเดิม (หดวันจบ = ให้ออก / แบ่งช่วง — แสดงจากช่วงวันที่แล้ว)
+      const oe = day(o.end_date);
+      const ne = day(n.end_date);
+      const longer = Boolean(oe) && (!ne || ne > oe!) && Boolean(o.is_manager) === Boolean(n.is_manager);
+      // รวมแถว: แสดงที่เหตุการณ์ "รวม" ของแถวที่ถูกปิดแล้ว
+      const merged = longer && sibling(l, o, (o2, n2) => Boolean(o2.Actived) && !n2.Actived && covers(n, o2));
+      if (longer && !merged)
+        ev.push({
+          key: `log${l.Log_ID}`, date, type: n.is_manager ? "mgrextend" : "extend", name: who, ...meta,
+          sub: `${code} · ${r ? posLabel(r) : ""} · ${fmtRange(day(n.start_date), ne)}`,
+          diffs: [{ field: "วันที่จบ", old: dateVal(o.end_date), new: dateVal(n.end_date) }],
+        });
+      continue;
+    }
+    // เลื่อนวันเริ่มให้เร็วขึ้นอย่างเดียว (ตำแหน่ง / หัวหน้า / วันจบเดิม) = ต่อช่วงเข้ากับรายการเดิม ไม่ใช่แก้ข้อมูลกรอกผิด
+    const os = day(o.start_date);
+    const ns = day(n.start_date);
+    if (
+      os && ns && ns < os && str(o.PositionID) === str(n.PositionID)
+      && Boolean(o.is_manager) === Boolean(n.is_manager) && day(o.end_date) === day(n.end_date)
+    ) {
+      ev.push({
+        key: `log${l.Log_ID}`, date, type: n.is_manager ? "mgrextend" : "extend", name: who, ...meta,
+        sub: `${code} · ${r ? posLabel(r) : ""} · ${fmtRange(ns, day(n.end_date))}`,
+        diffs: [{ field: "วันที่เริ่ม", old: dateVal(o.start_date), new: dateVal(n.start_date) }],
+      });
+      continue;
+    }
+    // เลื่อนวันเริ่มให้ช้าลงอย่างเดียว เพราะอีกแถวขยายวันจบมาต่อพอดี (ตั้ง/ถอดหัวหน้าต่อจากช่วงเดิม)
+    // — แสดงที่เหตุการณ์ "ขยายช่วง" ของอีกแถวแล้ว
+    if (
+      os && ns && ns > os && str(o.PositionID) === str(n.PositionID)
+      && Boolean(o.is_manager) === Boolean(n.is_manager) && day(o.end_date) === day(n.end_date)
+      && sibling(l, o, (o2, n2) => day(n2.end_date) === addDays(ns, -1) && day(o2.end_date) !== day(n2.end_date))
+    )
+      continue;
     const diffs: Diff[] = [];
     if (str(o.PositionID) !== str(n.PositionID))
       diffs.push({ field: "ตำแหน่ง", old: optLabel(lookups.positions, o.PositionID), new: optLabel(lookups.positions, n.PositionID) });

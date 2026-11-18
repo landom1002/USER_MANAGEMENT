@@ -146,11 +146,11 @@ export async function createCompanyUnit(input: { comId: number; unit_code: strin
     const c = await pool.request().input("c", sql.Int, comId).input("code", sql.VarChar(40), code).query(`
       SELECT (SELECT COUNT(*) FROM dbo.Company WHERE ComID = @c) AS com,
              (SELECT COUNT(*) FROM dbo.Org_Unit WHERE ComID = @c AND unit_type = 'COMPANY' AND Actived = 1) AS roots,
-             (SELECT COUNT(*) FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code) AS dup`);
+             (SELECT COUNT(*) FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code AND Actived = 1) AS dup`);
     const r = c.recordset[0];
     if (!r.com) throw new UserError("ไม่พบบริษัท");
     if (r.roots) throw new UserError("บริษัทนี้มีห้องระดับบริษัทอยู่แล้ว");
-    if (r.dup) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+    if (r.dup) throw new UserError(`รหัสห้อง ${code} ถูกใช้กับห้องอื่นที่เปิดอยู่ในบริษัทนี้แล้ว`);
     await pool.request()
       .input("c", sql.Int, comId).input("code", sql.VarChar(40), code).input("name", sql.NVarChar(150), name)
       .input("by", sql.VarChar(50), byOf(input.by))
@@ -171,8 +171,8 @@ export async function createUnit(input: UnitInput & { parentId: number; unit_cod
     if (!p.recordset.length) throw new UserError("ไม่พบห้องแม่ (หรือถูกปิดแล้ว)");
     const comId = p.recordset[0].ComID as number;
     const dup = await pool.request().input("c", sql.Int, comId).input("code", sql.VarChar(40), code)
-      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code`);
-    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code AND Actived = 1`);
+    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} ถูกใช้กับห้องอื่นที่เปิดอยู่ในบริษัทนี้แล้ว`);
     await pool.request()
       .input("c", sql.Int, comId).input("code", sql.VarChar(40), code).input("type", sql.VarChar(10), type)
       .input("name", sql.NVarChar(150), name).input("p", sql.Int, parentId)
@@ -192,8 +192,8 @@ export async function updateUnit(input: UnitInput & { unitId: number; unit_code:
     const cur = await pool.request().input("u", sql.Int, unitId).query(`SELECT unit_type, ComID FROM dbo.Org_Unit WHERE Unit_ID = @u AND Actived = 1`);
     if (!cur.recordset.length) throw new UserError("ไม่พบห้อง (หรือถูกปิดแล้ว)");
     const dup = await pool.request().input("c", sql.Int, cur.recordset[0].ComID).input("code", sql.VarChar(40), code).input("u", sql.Int, unitId)
-      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code AND Unit_ID <> @u`);
-    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} มีอยู่แล้วในบริษัทนี้`);
+      .query(`SELECT 1 FROM dbo.Org_Unit WHERE ComID = @c AND unit_code = @code AND Unit_ID <> @u AND Actived = 1`);
+    if (dup.recordset.length) throw new UserError(`รหัสห้อง ${code} ถูกใช้กับห้องอื่นที่เปิดอยู่ในบริษัทนี้แล้ว`);
     // ห้องบริษัทเปลี่ยนประเภทไม่ได้ และห้องอื่นเปลี่ยนเป็นบริษัทไม่ได้
     const type = cur.recordset[0].unit_type === "COMPANY" ? "COMPANY" : await unitType(input.unit_type);
     await pool.request()
@@ -222,6 +222,32 @@ export async function deactivateUnit(input: { unitId: number; by?: string }): Pr
     await pool.request().input("u", sql.Int, unitId).input("by", sql.VarChar(50), byOf(input.by)).query(`
       UPDATE dbo.Org_Unit SET Actived = 0, UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
       WHERE Unit_ID = @u`);
+    return getUnits();
+  });
+}
+
+/** เปิดห้องที่ปิดไปกลับมา (เลิกทำการปิดห้อง) — ห้องแม่ต้องยังเปิดอยู่ และรหัสห้องต้องไม่ซ้ำกับห้องที่เปิดอยู่ */
+export async function reactivateUnit(input: { unitId: number; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+  return run(async () => {
+    const unitId = int(input.unitId, "Unit_ID");
+    const pool = await getPool();
+    const c = await pool.request().input("u", sql.Int, unitId).query(`
+      SELECT u.Actived, u.unit_code, u.parent_unit_id,
+             p.Actived AS parent_active, p.unit_code AS parent_code,
+             (SELECT COUNT(*) FROM dbo.Org_Unit d
+               WHERE d.ComID = u.ComID AND d.unit_code = u.unit_code AND d.Unit_ID <> u.Unit_ID AND d.Actived = 1) AS dup
+      FROM dbo.Org_Unit u
+      LEFT JOIN dbo.Org_Unit p ON p.Unit_ID = u.parent_unit_id
+      WHERE u.Unit_ID = @u`);
+    const r = c.recordset[0];
+    if (!r) throw new UserError("ไม่พบห้อง");
+    if (r.Actived) throw new UserError(`ห้อง ${r.unit_code} เปิดอยู่แล้ว`);
+    if (r.parent_unit_id != null && !r.parent_active)
+      throw new UserError(`ห้องแม่ ${r.parent_code ?? ""} ถูกปิดไปแล้ว — เปิดห้อง ${r.unit_code} กลับไม่ได้`);
+    if (r.dup > 0) throw new UserError(`รหัสห้อง ${r.unit_code} ถูกใช้กับห้องอื่นที่เปิดอยู่แล้ว`);
+    await pool.request().input("u", sql.Int, unitId).input("by", sql.VarChar(50), byOf(input.by)).query(`
+      UPDATE dbo.Org_Unit SET Actived = 1, UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
+      WHERE Unit_ID = @u AND Actived = 0`);
     return getUnits();
   });
 }
@@ -296,28 +322,68 @@ export async function publishDefaultLayout(): Promise<ActionResult<null>> {
 // ทุก action ของสมาชิกคืน units ใหม่ (จำนวนคน / หัวหน้าบน node เปลี่ยน) — dialog โหลดรายชื่อใหม่เอง
 
 export async function addMember(input: {
-  unitId: number; userId: number; positionId: number; isManager: boolean; date: string; by?: string;
+  unitId: number; userId: number; positionId: number; isManager: boolean; date: string; endDate?: string | null; by?: string;
 }): Promise<ActionResult<OrgUnitRow[]>> {
   return run(async () => {
     const unitId = int(input.unitId, "Unit_ID");
     const userId = int(input.userId, "ผู้ใช้");
     const positionId = int(input.positionId, "ตำแหน่ง");
     const d = date(input.date);
+    const end = optDate(input.endDate, "วันที่จบ");
+    if (end && end < d) throw new UserError("วันที่จบต้องไม่ก่อนวันที่เริ่ม");
     let note: string | null = null;
     await tx(async (t) => {
-      // ยังไม่มีห้องหลักตั้งแต่วันที่มีผลเป็นต้นไป -> ห้องนี้เป็นห้องหลัก
-      const p = await new sql.Request(t).input("uid", sql.BigInt, userId).input("d", sql.VarChar(10), d).query(`
+      // ไม่มีห้องหลักที่ทับช่วง [d, end] -> ห้องนี้เป็นห้องหลัก
+      const p = await new sql.Request(t).input("uid", sql.BigInt, userId)
+        .input("d", sql.VarChar(10), d).input("end", sql.VarChar(10), end).query(`
         SELECT COUNT(*) AS n FROM dbo.Org_Member
         WHERE UserID = @uid AND Actived = 1 AND is_primary = 1
-          AND (end_date IS NULL OR end_date >= CAST(@d AS date))`);
+          AND (end_date IS NULL OR end_date >= CAST(@d AS date))
+          AND (@end IS NULL OR start_date IS NULL OR start_date <= CAST(@end AS date))`);
       const isPrimary = p.recordset[0].n === 0;
-      if (isPrimary) note = "ตั้งเป็นห้องหลักให้อัตโนมัติ (ยังไม่มีห้องหลัก)";
-      await new sql.Request(t)
+      const notes: string[] = [];
+      if (isPrimary) notes.push("ตั้งเป็นห้องหลักให้อัตโนมัติ (ช่วงนี้ยังไม่มีห้องหลัก)");
+      const req = () => new sql.Request(t)
         .input("unit", sql.Int, unitId).input("uid", sql.BigInt, userId).input("pos", sql.Int, positionId)
         .input("mgr", sql.Bit, Boolean(input.isManager)).input("pri", sql.Bit, isPrimary)
-        .input("d", sql.VarChar(10), d).input("by", sql.VarChar(50), byOf(input.by))
-        .query(`INSERT dbo.Org_Member (Unit_ID, UserID, PositionID, is_manager, is_primary, start_date, end_date, Actived, CreateBy)
-                VALUES (@unit, @uid, @pos, @mgr, @pri, CAST(@d AS date), NULL, 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50)))`);
+        .input("d", sql.VarChar(10), d).input("end", sql.VarChar(10), end).input("by", sql.VarChar(50), byOf(input.by));
+
+      // แถวเดิม (ห้อง / ตำแหน่ง / หัวหน้า / ห้องหลักเหมือนกัน) ที่ช่วงวันที่ต่อกันพอดี
+      //   prev: จบวันที่ d-1 · next: เริ่มวันที่ end+1  -> ขยายแถวเดิมแทนการเพิ่มแถวใหม่
+      const adj = await req().query(`
+        SELECT Member_ID, CONVERT(varchar(10), end_date, 23) AS end_date,
+               CASE WHEN end_date = DATEADD(DAY, -1, CAST(@d AS date)) THEN 'prev' ELSE 'next' END AS side
+        FROM dbo.Org_Member WITH (UPDLOCK)
+        WHERE UserID = @uid AND Unit_ID = @unit AND Actived = 1
+          AND PositionID = @pos AND is_manager = @mgr AND is_primary = @pri
+          AND (   end_date = DATEADD(DAY, -1, CAST(@d AS date))
+               OR (@end IS NOT NULL AND start_date = DATEADD(DAY, 1, CAST(@end AS date))))`);
+      const rows = adj.recordset as { Member_ID: number; end_date: string | null; side: "prev" | "next" }[];
+      const prev = rows.find((r) => r.side === "prev");
+      const next = rows.find((r) => r.side === "next");
+      const upd = `UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()`;
+
+      if (prev && next) {
+        // เติมช่องว่างพอดี -> รวม 3 ช่วงเป็นแถวเดียว (แถวหลังถูกรวมเข้าแถวแรก)
+        // ปิดแถวหลังก่อน แล้วค่อยขยายแถวแรก — trigger ห้ามคนเดียวกันอยู่ห้องเดียวกันซ้อนวัน
+        await req().input("p", sql.Int, prev.Member_ID).input("n", sql.Int, next.Member_ID)
+          .input("nEnd", sql.VarChar(10), next.end_date).query(`
+          UPDATE dbo.Org_Member SET Actived = 0, ${upd} WHERE Member_ID = @n;
+          UPDATE dbo.Org_Member SET end_date = CAST(@nEnd AS date), ${upd} WHERE Member_ID = @p;`);
+        notes.push("ช่วงวันที่ต่อกับรายการเดิมทั้งก่อนและหลัง — รวมเป็นรายการเดียว");
+      } else if (prev) {
+        await req().input("p", sql.Int, prev.Member_ID)
+          .query(`UPDATE dbo.Org_Member SET end_date = CAST(@end AS date), ${upd} WHERE Member_ID = @p`);
+        notes.push("ช่วงวันที่ต่อกับรายการเดิม — ขยายวันจบของรายการเดิมแทนการเพิ่มใหม่");
+      } else if (next) {
+        await req().input("n", sql.Int, next.Member_ID)
+          .query(`UPDATE dbo.Org_Member SET start_date = CAST(@d AS date), ${upd} WHERE Member_ID = @n`);
+        notes.push("ช่วงวันที่ต่อกับรายการเดิม — เลื่อนวันเริ่มของรายการเดิมแทนการเพิ่มใหม่");
+      } else {
+        await req().query(`INSERT dbo.Org_Member (Unit_ID, UserID, PositionID, is_manager, is_primary, start_date, end_date, Actived, CreateBy)
+                VALUES (@unit, @uid, @pos, @mgr, @pri, CAST(@d AS date), CAST(@end AS date), 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50)))`);
+      }
+      note = notes.length ? notes.join(" · ") : null;
     });
     return { data: await getUnits(), note };
   });
@@ -354,8 +420,14 @@ export async function setPrimary(input: { memberId: number; date: string; by?: s
   });
 }
 
-/** ตั้ง / ถอดหัวหน้า 1 แถวภายใน transaction — แบ่งแถวตามวันที่: แถวเดิมจบ d-1 · แถวใหม่เริ่ม d ถึง end เดิม (ถ้าแถวเริ่มก่อน d) */
-async function applyManager(t: sql.Transaction, memberId: number, isManager: boolean, d: string, by: string | null) {
+/**
+ * ตั้ง / ถอดหัวหน้า 1 แถวภายใน transaction ช่วง [d, until] (until = null -> ถึงวันจบเดิมของแถว)
+ * แบ่งแถวเดิมเป็นสูงสุด 3 ชิ้น (ทุกชิ้นได้ตำแหน่ง / ห้องหลักเดิม):
+ *   A [start, d-1]       สถานะหัวหน้าเดิม  (ถ้าแถวเริ่มก่อน d) — ใช้แถวเดิม
+ *   B [d, until]         สถานะใหม่
+ *   C [until+1, end]     กลับเป็นสถานะเดิม (ถ้า until จบก่อนแถวเดิม)
+ */
+async function applyManager(t: sql.Transaction, memberId: number, isManager: boolean, d: string, by: string | null, until: string | null = null) {
   const cur = await new sql.Request(t).input("m", sql.Int, memberId).query(`
     SELECT m.Unit_ID, m.is_manager, m.Actived, un.unit_code,
            CONVERT(varchar(10), m.start_date, 23) AS start_date,
@@ -371,60 +443,134 @@ async function applyManager(t: sql.Transaction, memberId: number, isManager: boo
     throw new UserError("วันที่มีผลไม่อยู่ในช่วงวันที่ของรายการนี้");
   if (Boolean(row.is_manager) === isManager)
     throw new UserError(isManager ? "คนนี้เป็นหัวหน้าห้องนี้อยู่แล้ว" : "คนนี้ไม่ได้เป็นหัวหน้าห้องนี้");
+  if (until && until < d) throw new UserError("\"ถึงวันที่\" ต้องไม่ก่อนวันที่มีผล");
+  if (until && row.end_date && until > row.end_date)
+    throw new UserError(`"ถึงวันที่" เกินช่วงที่คนนี้อยู่ห้อง (จบ ${row.end_date})`);
+
+  const hasA = !row.start_date || row.start_date < d;
+  const hasC = Boolean(until) && (!row.end_date || until! < row.end_date);
+  const bEnd = hasC ? until : row.end_date;
+
+  // แถวข้างเคียงของคนนี้ในห้องนี้ (ตำแหน่ง / ห้องหลักเดิม) ที่มีสถานะหัวหน้า "ใหม่" และต่อกับชิ้น B พอดี
+  //   P: จบวันก่อน d พอดี (มีได้เฉพาะเมื่อ B เริ่มที่ต้นแถว = !hasA)
+  //   N: เริ่มวันถัดจากปลาย B พอดี (มีได้เฉพาะเมื่อ B จบที่ปลายแถว = !hasC)
+  // -> ต่อช่วงของแถวข้างเคียงแทนการเพิ่ม / แยกแถวใหม่
+  const adj = await new sql.Request(t)
+    .input("m", sql.Int, memberId).input("mgr", sql.Bit, isManager)
+    .input("d", sql.VarChar(10), d).input("bEnd", sql.VarChar(10), bEnd)
+    .input("wantP", sql.Bit, !hasA).input("wantN", sql.Bit, !hasC && Boolean(bEnd)).query(`
+    SELECT o.Member_ID, CONVERT(varchar(10), o.end_date, 23) AS end_date,
+           CASE WHEN o.end_date = DATEADD(DAY, -1, CAST(@d AS date)) THEN 'P' ELSE 'N' END AS side
+    FROM dbo.Org_Member m
+    JOIN dbo.Org_Member o WITH (UPDLOCK)
+      ON o.UserID = m.UserID AND o.Unit_ID = m.Unit_ID AND o.PositionID = m.PositionID AND o.is_primary = m.is_primary
+     AND o.Member_ID <> m.Member_ID AND o.Actived = 1 AND o.is_manager = @mgr
+    WHERE m.Member_ID = @m
+      AND (   (@wantP = 1 AND o.end_date = DATEADD(DAY, -1, CAST(@d AS date)))
+           OR (@wantN = 1 AND o.start_date = DATEADD(DAY, 1, CAST(@bEnd AS date))))`);
+  const sides = adj.recordset as { Member_ID: number; end_date: string | null; side: "P" | "N" }[];
+  const P = sides.find((x) => x.side === "P") ?? null;
+  const N = sides.find((x) => x.side === "N") ?? null;
 
   const req = () => new sql.Request(t)
-    .input("m", sql.Int, memberId).input("mgr", sql.Bit, isManager)
-    .input("d", sql.VarChar(10), d).input("end", sql.VarChar(10), row.end_date).input("by", sql.VarChar(50), by);
-  if (!row.start_date || row.start_date < d) {
-    await req().query(`
-      UPDATE dbo.Org_Member SET end_date = DATEADD(DAY, -1, CAST(@d AS date)),
-             UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
-      WHERE Member_ID = @m;
+    .input("m", sql.Int, memberId).input("mgr", sql.Bit, isManager).input("old", sql.Bit, Boolean(row.is_manager))
+    .input("d", sql.VarChar(10), d).input("bEnd", sql.VarChar(10), bEnd).input("until", sql.VarChar(10), until)
+    .input("end", sql.VarChar(10), row.end_date).input("by", sql.VarChar(50), by)
+    .input("p", sql.Int, P?.Member_ID ?? null).input("n", sql.Int, N?.Member_ID ?? null)
+    .input("nEnd", sql.VarChar(10), N?.end_date ?? null);
+  const upd = `UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()`;
+  const ins = (mgr: string, s: string, e: string) => `
       INSERT dbo.Org_Member (Unit_ID, UserID, PositionID, is_manager, is_primary, start_date, end_date, Actived, CreateBy)
-      SELECT Unit_ID, UserID, PositionID, @mgr, is_primary, CAST(@d AS date), CAST(@end AS date), 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50))
-      FROM dbo.Org_Member WHERE Member_ID = @m;`);
+      SELECT Unit_ID, UserID, PositionID, ${mgr}, is_primary, ${s}, ${e}, 1, ISNULL(@by, LEFT(SUSER_SNAME(), 50))
+      FROM dbo.Org_Member WHERE Member_ID = @m;`;
+  // ปลายช่วงสถานะใหม่หลังต่อกับ N (null = ไม่มีวันจบ)
+  const tail = N ? "CAST(@nEnd AS date)" : "CAST(@bEnd AS date)";
+
+  // ลำดับสำคัญ: หด / ปิดแถวก่อนแล้วค่อยขยาย / เพิ่ม — trigger ห้ามคนเดียวกันอยู่ห้องเดียวกันซ้อนวัน
+  let q: string;
+  if (hasA) {
+    // A = แถวเดิม · B ต่อเข้า N ถ้ามี ไม่อย่างนั้นเพิ่มแถวใหม่ · C เพิ่มแถวใหม่
+    q = `UPDATE dbo.Org_Member SET end_date = DATEADD(DAY, -1, CAST(@d AS date)), ${upd} WHERE Member_ID = @m;
+         ${N ? `UPDATE dbo.Org_Member SET start_date = CAST(@d AS date), ${upd} WHERE Member_ID = @n;`
+             : ins("@mgr", "CAST(@d AS date)", "CAST(@bEnd AS date)")}
+         ${hasC ? ins("@old", "DATEADD(DAY, 1, CAST(@until AS date))", "CAST(@end AS date)") : ""}`;
+  } else if (P && hasC) {
+    // B ต่อท้าย P · แถวเดิมกลายเป็น C (เลื่อนวันเริ่ม) — ไม่มีแถวใหม่
+    q = `UPDATE dbo.Org_Member SET start_date = DATEADD(DAY, 1, CAST(@until AS date)), ${upd} WHERE Member_ID = @m;
+         UPDATE dbo.Org_Member SET end_date = CAST(@until AS date), ${upd} WHERE Member_ID = @p;`;
+  } else if (P) {
+    // ทั้งแถวเดิม (และ N ถ้ามี) รวมเข้า P
+    q = `UPDATE dbo.Org_Member SET Actived = 0, ${upd} WHERE Member_ID = @m;
+         ${N ? `UPDATE dbo.Org_Member SET Actived = 0, ${upd} WHERE Member_ID = @n;` : ""}
+         UPDATE dbo.Org_Member SET end_date = ${tail}, ${upd} WHERE Member_ID = @p;`;
   } else {
-    await req().query(`
-      UPDATE dbo.Org_Member SET is_manager = @mgr,
-             UpdateBy = ISNULL(@by, LEFT(SUSER_SNAME(), 50)), UpdateDate = GETDATE()
-      WHERE Member_ID = @m`);
+    // แถวเดิม = B (รวม N เข้ามาถ้ามี) · C เพิ่มแถวใหม่
+    q = `${N ? `UPDATE dbo.Org_Member SET Actived = 0, ${upd} WHERE Member_ID = @n;` : ""}
+         UPDATE dbo.Org_Member SET is_manager = @mgr, end_date = ${tail}, ${upd} WHERE Member_ID = @m;
+         ${hasC ? ins("@old", "DATEADD(DAY, 1, CAST(@until AS date))", "CAST(@end AS date)") : ""}`;
   }
+  await req().query(q);
   return row;
 }
 
-export async function setManager(input: { memberId: number; isManager: boolean; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+export async function setManager(input: {
+  memberId: number; isManager: boolean; date: string; until?: string | null; by?: string;
+}): Promise<ActionResult<OrgUnitRow[]>> {
   return run(async () => {
     const memberId = int(input.memberId, "Member_ID");
     const isManager = Boolean(input.isManager);
     const d = date(input.date);
+    const until = optDate(input.until, "ถึงวันที่");
     let note: string | null = null;
     await tx(async (t) => {
-      const row = await applyManager(t, memberId, isManager, d, byOf(input.by));
-      if (!isManager) note = `ห้อง ${row.unit_code} จะไม่มีหัวหน้าตั้งแต่ ${d} (สายอนุมัติจะขึ้นไปห้องแม่)`;
+      const row = await applyManager(t, memberId, isManager, d, byOf(input.by), until);
+      if (!isManager)
+        note = `ห้อง ${row.unit_code} จะไม่มีหัวหน้าตั้งแต่ ${d}${until ? ` ถึง ${until}` : ""} (สายอนุมัติจะขึ้นไปห้องแม่)`;
     });
     return { data: await getUnits(), note };
   });
 }
 
-/** เปลี่ยนหัวหน้า (ลากวาง): ถอดหัวหน้าเดิม ณ วันที่ d แล้วตั้งคนใหม่ — transaction เดียว ไม่มีช่วงว่าง/ซ้อน */
-export async function replaceManager(input: { memberId: number; date: string; by?: string }): Promise<ActionResult<OrgUnitRow[]>> {
+/**
+ * เปลี่ยนหัวหน้า — transaction เดียว ไม่มีช่วงว่าง/ซ้อน
+ * - ไม่ส่ง until (ลากวางวันนี้): ถอดหัวหน้าที่คลุมวันที่ d แล้วตั้งคนใหม่ตั้งแต่ d
+ * - ส่ง until (ฟอร์มเลือกช่วง, null = ถึงวันจบของแถว): ถอดหัวหน้าทุกคนเฉพาะส่วนที่ทับช่วง [d, until] แล้วตั้งคนใหม่ช่วงนั้น
+ */
+export async function replaceManager(input: {
+  memberId: number; date: string; until?: string | null; by?: string;
+}): Promise<ActionResult<OrgUnitRow[]>> {
   return run(async () => {
     const memberId = int(input.memberId, "Member_ID");
     const d = date(input.date);
+    const ranged = "until" in input;
+    const until = optDate(input.until, "ถึงวันที่");
     const by = byOf(input.by);
     await tx(async (t) => {
       const u = await new sql.Request(t).input("m", sql.Int, memberId).query(`
-        SELECT Unit_ID FROM dbo.Org_Member WHERE Member_ID = @m AND Actived = 1`);
+        SELECT Unit_ID, CONVERT(varchar(10), end_date, 23) AS end_date FROM dbo.Org_Member WHERE Member_ID = @m AND Actived = 1`);
       const unitId = u.recordset[0]?.Unit_ID as number | undefined;
       if (unitId == null) throw new UserError("ไม่พบรายการนี้ (หรือถูกยกเลิกแล้ว)");
-      // หัวหน้าที่คลุมวันที่ d (ไม่นับตัวเอง) -> ถอดก่อน แล้วค่อยตั้งคนใหม่ (trigger ห้ามหัวหน้าซ้อน)
-      const olds = await new sql.Request(t).input("u", sql.Int, unitId).input("m", sql.Int, memberId).input("d", sql.VarChar(10), d).query(`
-        SELECT Member_ID FROM dbo.Org_Member WITH (UPDLOCK)
+      // ปลายช่วงที่จะเป็นหัวหน้า (null = ไม่มีวันจบ)
+      const rEnd: string | null = ranged ? (until ?? u.recordset[0].end_date ?? null) : d;
+      // หัวหน้าคนอื่นที่ทับช่วง -> ถอดเฉพาะส่วนที่ทับก่อน แล้วค่อยตั้งคนใหม่ (trigger ห้ามหัวหน้าซ้อน)
+      const olds = await new sql.Request(t)
+        .input("u", sql.Int, unitId).input("m", sql.Int, memberId)
+        .input("d", sql.VarChar(10), d).input("e", sql.VarChar(10), rEnd).query(`
+        SELECT Member_ID, CONVERT(varchar(10), start_date, 23) AS start_date, CONVERT(varchar(10), end_date, 23) AS end_date
+        FROM dbo.Org_Member WITH (UPDLOCK)
         WHERE Unit_ID = @u AND Actived = 1 AND is_manager = 1 AND Member_ID <> @m
-          AND (start_date IS NULL OR start_date <= CAST(@d AS date))
-          AND (end_date IS NULL OR end_date >= CAST(@d AS date))`);
-      for (const o of olds.recordset as { Member_ID: number }[]) await applyManager(t, o.Member_ID, false, d, by);
-      await applyManager(t, memberId, true, d, by);
+          AND (end_date IS NULL OR end_date >= CAST(@d AS date))
+          AND (@e IS NULL OR start_date IS NULL OR start_date <= CAST(@e AS date))`);
+      for (const o of olds.recordset as { Member_ID: number; start_date: string | null; end_date: string | null }[]) {
+        if (!ranged) {
+          await applyManager(t, o.Member_ID, false, d, by);
+          continue;
+        }
+        const s = o.start_date && o.start_date > d ? o.start_date : d;
+        const e = !rEnd ? null : o.end_date && o.end_date < rEnd ? null : rEnd; // null = ถึงวันจบของแถวนั้น
+        await applyManager(t, o.Member_ID, false, s, by, e);
+      }
+      await applyManager(t, memberId, true, d, by, ranged ? until : null);
     });
     return getUnits();
   });

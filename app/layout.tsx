@@ -17,7 +17,17 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     <html lang="th" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <TooltipProvider>{children}</TooltipProvider>
-        <Toaster position="top-center" richColors />
+        <Toaster
+          position="top-center"
+          richColors
+          toastOptions={{
+            // ปุ่ม action (เช่น "เลิกทำ") ใช้สีเดียวกับ toast แต่ละประเภท — แบบขอบ แทนปุ่มดำค่าเริ่มต้น
+            classNames: {
+              actionButton:
+                "border! border-current/40! bg-transparent! text-current! font-medium! hover:bg-current/10! transition-colors",
+            },
+          }}
+        />
       </body>
     </html>
   );

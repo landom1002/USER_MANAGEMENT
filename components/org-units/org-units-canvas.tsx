@@ -23,7 +23,7 @@ import {
   type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { BookmarkCheck, Building2, CloudOff, Crown, Filter, LayoutGrid, Plus, Redo2, TriangleAlert, Undo2, Users } from "lucide-react";
+import { BookmarkCheck, Building2, CloudOff, Crown, Filter, LayoutGrid, LocateFixed, Plus, PowerOff, Redo2, TriangleAlert, Undo2, Users, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { SearchInput } from "@/components/ui/search-input";
@@ -37,8 +37,17 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { cn } from "@/lib/utils";
-import { layoutByLevel, placeUnder, rowHeight, rowStep, type LevelLayoutOpts, type XY } from "@/lib/flow/layout";
+import { layoutTree, placeUnder, rowHeight, type TreeLayoutOpts, type XY } from "@/lib/flow/layout";
 import { useFlowHistory } from "@/lib/flow/use-flow-history";
 import { SnapGuides, useSnapGuides } from "@/lib/flow/use-snap-guides";
 import type { OrgRules } from "@/lib/org/rules";
@@ -62,23 +71,43 @@ type UnitNodeData = {
 
 const NODE_W = 160;
 const NODE_H = 78;
-const LAYOUT: LevelLayoutOpts = { nodeW: NODE_W, nodeH: NODE_H, ranksep: 50, nodesep: 14, groupGap: 160 };
+const LAYOUT: TreeLayoutOpts = { nodeW: NODE_W, nodeH: NODE_H, ranksep: 50, nodesep: 14, groupGap: 160 };
 
 /** ปุ่ม + ใต้ node เรียกเปิดฟอร์มเพิ่มห้องลูก — ส่งผ่าน context เพราะ node component สร้างโดย React Flow */
 const AddChildContext = createContext<(u: OrgUnitRow) => void>(() => {});
 
-function UnitNode({ data, isConnectable }: NodeProps) {
+function UnitNode({ data, isConnectable, selected }: NodeProps) {
   const { unit: u, color, levelLabel, warnings, highlighted, dimmed } = data as unknown as UnitNodeData;
   const onAddChild = useContext(AddChildContext);
   return (
     <div
+      // nopan: ดับเบิลคลิกที่ห้อง = เปิดรายชื่อ ไม่ใช่ซูม (ปุ่มกลาง / ขวายังเลื่อนผังได้ · ลากห้องยังได้)
       className={cn(
-        "group relative flex w-40 cursor-pointer flex-col gap-0.5 rounded-lg border px-2.5 py-1.5 shadow-sm transition-all duration-150",
+        "nopan group relative flex w-40 cursor-pointer flex-col gap-0.5 rounded-lg border px-2.5 py-1.5 shadow-sm transition-all duration-150",
+        // เลือกอยู่: แสงรอบโหนด (outline สีเดียวกันแบบโปร่ง) + พื้นเข้มขึ้น — เส้นประวาดเป็นชั้นซ้อนด้านล่าง
+        // ไม่เปลี่ยนความหนาขอบ / padding จริง -> node ไม่ขยับ · outline ไม่ชนกับ ring ของผลค้นหา (ring ใช้ box-shadow)
+        selected && "shadow-lg outline-4 outline-offset-3",
         highlighted && "shadow-md ring-2 ring-primary",
         dimmed && "opacity-25",
       )}
-      style={tint(color)}
+      style={
+        selected
+          ? {
+              borderColor: "transparent",
+              background: `color-mix(in srgb, ${color} 22%, var(--card))`,
+              outlineColor: `color-mix(in srgb, ${color} 35%, transparent)`,
+            }
+          : tint(color)
+      }
     >
+      {/* เส้นประหนา 3px สีเดิม — ทับขอบ 1px เดิมพอดี (-inset-px) แล้วหนาเข้าด้านใน ไม่กระทบ layout */}
+      {selected && (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute -inset-px rounded-lg border-3 border-dashed"
+          style={{ borderColor: color }}
+        />
+      )}
       {u.unit_type !== "COMPANY" && (
         <Handle
           type="target"
@@ -189,28 +218,31 @@ function nodeData(u: OrgUnitRow, rules: OrgRules, byId: Map<number, OrgUnitRow>)
   };
 }
 
-/** จัดเรียงทุกห้อง (ทุกบริษัท แม้ที่ซ่อนอยู่) เป็นแถวตามระดับ — บริษัทเรียงซ้าย -> ขวาตาม ComID */
+/**
+ * จัดเรียงทุกห้อง (ทุกบริษัท แม้ที่ซ่อนอยู่) เป็นแถวตามลำดับชั้นของต้นไม้ — บริษัทเรียงซ้าย -> ขวาตาม ComID
+ * พี่น้องเรียงซ้าย -> ขวาตามประเภท (sort_no) แล้วชื่อห้อง
+ */
 function layoutAll(units: OrgUnitRow[], rules: OrgRules): Map<string, XY> {
-  return layoutByLevel(
+  return layoutTree(
     units.map((u) => ({
       id: String(u.Unit_ID),
       parent: u.parent_unit_id != null ? String(u.parent_unit_id) : null,
-      level: rules.level(u),
       group: u.ComID,
+      typeOrder: rules.type(u.unit_type).sort_no,
+      title: u.unit_name || u.unit_code,
     })),
     LAYOUT,
   );
 }
 
 /**
- * ห้องที่ยังไม่มีตำแหน่ง (สร้างใหม่ / ผังที่บันทึกไว้ไม่มี) -> แถวของระดับตัวเองใต้ห้องแม่ ต่อขวาจากพี่น้องคนขวาสุด
- * ห้องแม่ก็ยังไม่มีตำแหน่ง -> วางห้องแม่ก่อน · ไม่มีห้องแม่เลย -> ขวาสุดของผัง แถวตามระดับ
+ * ห้องที่ยังไม่มีตำแหน่ง (สร้างใหม่ / ผังที่บันทึกไว้ไม่มี) -> แถวถัดไปใต้ห้องแม่ ต่อขวาจากพี่น้องคนขวาสุด
+ * ห้องแม่ก็ยังไม่มีตำแหน่ง -> วางห้องแม่ก่อน · ไม่มีห้องแม่เลย -> ขวาสุดของผัง แถวบนสุด
  * แก้ `pos` ตรง ๆ · คืน true ถ้ามีการวางใหม่
  */
-function placeMissing(units: OrgUnitRow[], rules: OrgRules, byId: Map<number, OrgUnitRow>, pos: Map<string, XY>): boolean {
+function placeMissing(units: OrgUnitRow[], byId: Map<number, OrgUnitRow>, pos: Map<string, XY>): boolean {
   const missing = units.filter((u) => !pos.has(String(u.Unit_ID)));
   if (!missing.length) return false;
-  const maxLevel = Math.max(0, ...rules.types.map((t) => t.level_no ?? 0));
   const place = (u: OrgUnitRow, depth = 0): XY => {
     const id = String(u.Unit_ID);
     const known = pos.get(id);
@@ -223,12 +255,12 @@ function placeMissing(units: OrgUnitRow[], rules: OrgRules, byId: Map<number, Or
         .filter((s) => s.parent_unit_id === parent.Unit_ID && s.Unit_ID !== u.Unit_ID)
         .map((s) => pos.get(String(s.Unit_ID)))
         .filter((s): s is XY => !!s);
-      p = placeUnder(pp, rowStep(rules.level(parent), rules.level(u)), siblings, LAYOUT);
+      p = placeUnder(pp, siblings, LAYOUT);
     } else {
       const all = [...pos.values()];
       const right = all.length ? Math.max(...all.map((q) => q.x)) + NODE_W + (LAYOUT.groupGap ?? 120) : 0;
       const top = all.length ? Math.min(...all.map((q) => q.y)) : 0;
-      p = { x: right, y: top + Math.max(0, maxLevel - (rules.level(u) ?? maxLevel)) * rowHeight(LAYOUT) };
+      p = { x: right, y: top };
     }
     pos.set(id, p);
     return p;
@@ -328,15 +360,48 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
     rfRef.current?.fitView({ padding: 0.15, duration: 600 });
   }, []);
 
+  // เลื่อน / ซูมจนไม่เห็นห้องไหนในจอเลย -> แสดงปุ่ม "กลับมาที่ผัง"
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [offView, setOffView] = useState(false);
+  const checkInView = useCallback(() => {
+    const inst = rfRef.current;
+    const el = wrapRef.current;
+    if (!inst || !el) return;
+    const nodes = inst.getNodes();
+    if (nodes.length === 0) return setOffView(false);
+    const { x, y, zoom } = inst.getViewport();
+    const left = -x / zoom;
+    const top = -y / zoom;
+    const right = left + el.clientWidth / zoom;
+    const bottom = top + el.clientHeight / zoom;
+    const anyVisible = nodes.some((n) => {
+      const pos = inst.getInternalNode(n.id)?.internals.positionAbsolute ?? n.position;
+      const w = n.measured?.width ?? n.width ?? 0;
+      const h = n.measured?.height ?? n.height ?? 0;
+      return pos.x < right && pos.x + w > left && pos.y < bottom && pos.y + h > top;
+    });
+    setOffView(!anyVisible);
+  }, []);
+  // ระหว่างลาก / ซูม เช็กไม่เกินเฟรมละครั้ง
+  const inViewFrame = useRef(0);
+  const scheduleInViewCheck = useCallback(() => {
+    if (inViewFrame.current) return;
+    inViewFrame.current = requestAnimationFrame(() => {
+      inViewFrame.current = 0;
+      checkInView();
+    });
+  }, [checkInView]);
+  useEffect(() => () => cancelAnimationFrame(inViewFrame.current), []);
+
   // ข้อมูล / ตัวกรองเปลี่ยน -> สร้าง node ใหม่จากตำแหน่งที่จำไว้ (ตัวกรองแค่ซ่อน / แสดง ไม่จัดเรียงใหม่)
-  // ยังไม่มีตำแหน่งเลย -> จัดเรียงตามระดับทั้งผัง · ห้องใหม่ -> วางใต้ห้องแม่ · แล้วบันทึก
+  // ยังไม่มีตำแหน่งเลย -> จัดเรียงตามลำดับชั้นทั้งผัง · ห้องใหม่ -> วางใต้ห้องแม่ · แล้วบันทึก
   useEffect(() => {
     const isNewFilter = lastFilterRef.current !== filterKey;
     lastFilterRef.current = filterKey;
     collectPositions();
     const firstLayout = allPositions().size === 0 && units.length > 0;
     if (firstLayout) replacePositions(layoutAll(units, rules));
-    const placed = placeMissing(units, rules, byId, allPositions()) || firstLayout;
+    const placed = placeMissing(units, byId, allPositions()) || firstLayout;
     const { nodes, edges } = buildFlow(visibleUnits, rules, byId, allPositions());
     setRfNodes(nodes);
     setRfEdges(edges);
@@ -386,7 +451,7 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
     focusUnit(u.Unit_ID);
   }, [warned, focusUnit]);
 
-  /** จัดเรียงใหม่ตามระดับ — ทุกบริษัท (รวมที่ซ่อน) แล้วบันทึก · undo ได้ (เฉพาะห้องที่เห็นบนจอ) */
+  /** จัดเรียงใหม่ตามลำดับชั้น — ทุกบริษัท (รวมที่ซ่อน) แล้วบันทึก · undo ได้ (เฉพาะห้องที่เห็นบนจอ) */
   const relayout = useCallback(() => {
     checkpoint();
     const pos = layoutAll(units, rules);
@@ -415,9 +480,9 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
     (id: string, parentPos: XY) => {
       const u = byId.get(Number(id));
       const p = u?.parent_unit_id != null ? byId.get(u.parent_unit_id) : undefined;
-      return u && p ? parentPos.y + rowStep(rules.level(p), rules.level(u)) * rowHeight(LAYOUT) : null;
+      return u && p ? parentPos.y + rowHeight(LAYOUT) : null;
     },
-    [byId, rules],
+    [byId],
   );
   const getZoom = useCallback(() => rfRef.current?.getZoom() ?? 1, []);
   const parentIdOf = useCallback((id: string) => {
@@ -508,7 +573,31 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
     [byId, childrenOf],
   );
 
-  const handleNodeClick = useCallback((_: MouseEvent, node: Node) => setMembersUnitId(Number(node.id)), []);
+  // คลิกเดียว = เลือก (React Flow จัดการเอง) · ดับเบิลคลิก = เปิดรายชื่อสมาชิก
+  const handleNodeDoubleClick = useCallback((_: MouseEvent, node: Node) => setMembersUnitId(Number(node.id)), []);
+
+  // Delete / Backspace = ปิดห้องที่เลือก (ทีละห้อง) · Esc = ยกเลิกการเลือก
+  // ไม่ทำงานตอนพิมพ์ในช่องกรอก หรือมี dialog / เมนูเปิดอยู่
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Delete" && e.key !== "Backspace" && e.key !== "Escape") return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable)) return;
+      if (document.querySelector('[role="dialog"], [role="alertdialog"], [role="menu"]')) return;
+      const picked = nodesRef.current.filter((n) => n.selected);
+      if (!picked.length) return;
+      if (e.key === "Escape") {
+        setRfNodes((nds) => nds.map((n) => (n.selected ? { ...n, selected: false } : n)));
+        return;
+      }
+      e.preventDefault();
+      if (picked.length > 1) return void toast.info("เลือกทีละห้องเพื่อปิด");
+      const u = byId.get(Number(picked[0].id));
+      if (u) setDeactivating(u);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [byId, setRfNodes]);
 
   const companies = lookups.companies;
   const companiesInUse = companies.filter((c) => units.some((u) => u.ComID === c.ComID));
@@ -517,9 +606,46 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
   const totalPeople = visibleUnits.reduce((s, u) => s + u.members, 0);
   const openAddChild = useCallback((u: OrgUnitRow) => setUnitForm({ mode: "create", parent: u }), []);
 
+  // ----- คลิกขวา (shadcn ContextMenu) -----
+  // คลิกขวาที่ห้อง -> เลือกห้องนั้น + เมนูของห้อง · ที่ว่าง -> เฉพาะเมนูผัง (ปุ่มเดียวกับแถบเครื่องมือด้านบน)
+  // ลากด้วยปุ่มขวา = เลื่อนผัง -> ปล่อยแล้วไม่เปิดเมนู
+  // React Flow (panOnDrag มีปุ่มขวา) preventDefault ทุก contextmenu ใน pane -> Radix ไม่เปิดเมนู
+  // จึงดักตอน capture ที่ wrapper แล้วยิง contextmenu ใหม่ใส่ตัว trigger เอง (target = wrapper ไม่ผ่าน pane)
+  const [menuUnitId, setMenuUnitId] = useState<number | null>(null);
+  const rightDownRef = useRef<{ x: number; y: number } | null>(null);
+  const menuUnit = menuUnitId != null ? byId.get(menuUnitId) ?? null : null;
+  const handleCanvasContextMenuCapture = useCallback((e: MouseEvent<HTMLDivElement>) => {
+    if (e.target === e.currentTarget) return; // event ที่ยิงซ้ำด้านล่าง -> ปล่อยให้ Radix เปิดเมนู
+    const target = e.target as HTMLElement;
+    // ช่องกรอก -> เมนูของเบราว์เซอร์ (วาง / คัดลอก)
+    if (target.closest("input, textarea, [contenteditable='true']")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const down = rightDownRef.current;
+    rightDownRef.current = null;
+    if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
+    const id = target.closest(".react-flow__node")?.getAttribute("data-id");
+    setMenuUnitId(id ? Number(id) : null);
+    if (id) setRfNodes((nds) => nds.map((n) => (!!n.selected === (n.id === id) ? n : { ...n, selected: n.id === id })));
+    const el = e.currentTarget;
+    const { clientX, clientY, screenX, screenY } = e;
+    queueMicrotask(() =>
+      el.dispatchEvent(new globalThis.MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, clientX, clientY, screenX, screenY })),
+    );
+  }, [setRfNodes]);
+
   return (
-    <div className="relative h-[calc(100svh-var(--header-height))] w-full">
+    <div ref={wrapRef} className="relative h-[calc(100svh-var(--header-height))] w-full">
       <AddChildContext.Provider value={openAddChild}>
+      <ContextMenu>
+      <ContextMenuTrigger asChild>
+      <div
+        className="h-full w-full"
+        onContextMenuCapture={handleCanvasContextMenuCapture}
+        onMouseDownCapture={(e) => {
+          if (e.button === 2) rightDownRef.current = { x: e.clientX, y: e.clientY };
+        }}
+      >
       <ReactFlow
         nodes={rfNodes}
         edges={rfEdges}
@@ -527,7 +653,8 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
         onEdgesChange={onEdgesChange}
         onNodeDragStart={handleDragStart}
         onNodeDragStop={handleDragStop}
-        onNodeClick={handleNodeClick}
+        onNodeDoubleClick={handleNodeDoubleClick}
+        deleteKeyCode={null}
         onConnect={handleConnect}
         onConnectEnd={handleConnectEnd}
         isValidConnection={isValidConnection}
@@ -536,6 +663,8 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
           rfRef.current = inst;
           setTimeout(fitAll, 100);
         }}
+        onMove={scheduleInViewCheck}
+        onMoveEnd={checkInView}
         minZoom={0.05}
         selectionOnDrag
         selectionMode={SelectionMode.Partial}
@@ -633,7 +762,7 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
             <ToolButton tip="Redo (Ctrl+Shift+Z)" onClick={redo} disabled={!canRedo}>
               <Redo2 size={14} />
             </ToolButton>
-            <ToolButton tip="จัดเรียงใหม่ตามระดับ (บนลงล่าง)" onClick={relayout}>
+            <ToolButton tip="จัดเรียงใหม่ตามลำดับชั้น (บนลงล่าง)" onClick={relayout}>
               <LayoutGrid size={14} />
             </ToolButton>
             <ToolButton
@@ -645,6 +774,29 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
             </ToolButton>
           </div>
         </Panel>
+
+        {/* มีตัวกรอง (ซ่อนบริษัท / ค้นหา) -> ปุ่มล้างลอยกลางด้านบน ใต้แถบเครื่องมือ */}
+        {(hiddenComs.size > 0 || search.trim() !== "") && (
+          <Panel position="top-center" className="mt-14">
+            <Button
+              variant="destructive"
+              className="h-8 animate-in rounded-full shadow-md duration-200 fade-in slide-in-from-top-2"
+              onClick={() => {
+                setHiddenComs(new Set());
+                setSearch("");
+              }}
+            >
+              <X className="size-3.5" />
+              ล้างตัวกรอง
+              <span className="text-xs text-white/80">
+                {[
+                  hiddenComs.size > 0 && `ซ่อน ${hiddenComs.size} บริษัท`,
+                  search.trim() && `ค้นหา "${search.trim()}"`,
+                ].filter(Boolean).join(" · ")}
+              </span>
+            </Button>
+          </Panel>
+        )}
 
         {units.length === 0 && (
           <Panel position="top-center" className="mt-24">
@@ -661,25 +813,96 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
           </Panel>
         )}
 
-        <Panel position="bottom-center" className="mb-3">
-          <div className="flex items-center gap-3 rounded-lg border bg-background/90 px-3 py-2 shadow-sm backdrop-blur-sm">
-            {rules.types.map((t) => (
-              <div key={t.unit_type} className="flex items-center gap-1.5">
-                <span className="inline-block size-2.5 rounded-full" style={{ background: t.color }} />
-                <span className="text-[11px] text-muted-foreground">{t.name_th}</span>
-              </div>
-            ))}
-          </div>
-        </Panel>
+        {offView && (
+          <Panel position="bottom-center" className="mb-3">
+            <Button className="shadow-md" onClick={fitAll}>
+              <LocateFixed className="size-3.5" /> กลับมาที่ผัง
+            </Button>
+          </Panel>
+        )}
 
         <SnapGuides guides={guides} />
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-        <Controls />
         <MiniMap
+          position="bottom-left"
           nodeColor={(n) => (n.data as unknown as UnitNodeData).color ?? "#999"}
-          maskColor="hsl(var(--background) / 0.8)"
+          bgColor="var(--background)"
+          maskColor="color-mix(in oklch, var(--muted-foreground) 18%, transparent)"
+        />
+        {/* ปุ่มควบคุมแนวนอน ซ้อนอยู่มุมบนซ้ายภายใน minimap (minimap 200×150, margin 15)
+            render หลัง MiniMap เพื่อให้อยู่ชั้นบน */}
+        <Controls
+          position="bottom-left"
+          orientation="horizontal"
+          style={{ marginLeft: 19, marginBottom: 15 + 150 - 4 - 26 }}
         />
       </ReactFlow>
+      </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent className="w-60">
+        {menuUnit && (
+          <>
+            <ContextMenuLabel className="flex items-center gap-1.5">
+              <span className="font-mono text-foreground">{menuUnit.unit_code}</span>
+              <span className="truncate font-normal">{menuUnit.unit_name}</span>
+            </ContextMenuLabel>
+            <ContextMenuItem onSelect={() => setMembersUnitId(menuUnit.Unit_ID)}>
+              <Users /> รายชื่อสมาชิก
+              <ContextMenuShortcut>ดับเบิลคลิก</ContextMenuShortcut>
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => openAddChild(menuUnit)}>
+              <Plus /> เพิ่มห้องลูก
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => focusUnit(menuUnit.Unit_ID)}>
+              <LocateFixed /> ซูมไปที่ห้องนี้
+            </ContextMenuItem>
+            <ContextMenuItem variant="destructive" onSelect={() => setDeactivating(menuUnit)}>
+              <PowerOff /> ปิดห้อง
+              <ContextMenuShortcut>Del</ContextMenuShortcut>
+            </ContextMenuItem>
+            <ContextMenuSeparator />
+          </>
+        )}
+        {companiesWithoutRoot.length > 0 && (
+          <ContextMenuItem onSelect={() => setCompanyDialog(true)}>
+            <Building2 /> เพิ่มห้องบริษัท
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem onSelect={undo} disabled={!canUndo}>
+          <Undo2 /> Undo
+          <ContextMenuShortcut>Ctrl+Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={redo} disabled={!canRedo}>
+          <Redo2 /> Redo
+          <ContextMenuShortcut>Ctrl+Shift+Z</ContextMenuShortcut>
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem onSelect={relayout}>
+          <LayoutGrid /> จัดเรียงใหม่ตามลำดับชั้น
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={fitAll}>
+          <LocateFixed /> แสดงทั้งผัง
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={() => setPublishOpen(true)} disabled={!loggedIn}>
+          <BookmarkCheck /> {loggedIn ? "ตั้งผังนี้เป็นผังกลาง" : "ตั้งเป็นผังกลาง (ต้อง login)"}
+        </ContextMenuItem>
+        {warned.length > 0 && (
+          <ContextMenuItem onSelect={nextWarning} className="text-amber-600 focus:text-amber-700">
+            <TriangleAlert className="text-amber-600" /> ไปห้องที่ผิดกฎ ({warned.length})
+          </ContextMenuItem>
+        )}
+        {(hiddenComs.size > 0 || search.trim() !== "") && (
+          <ContextMenuItem
+            onSelect={() => {
+              setHiddenComs(new Set());
+              setSearch("");
+            }}
+          >
+            <X /> ล้างตัวกรอง
+          </ContextMenuItem>
+        )}
+      </ContextMenuContent>
+      </ContextMenu>
       </AddChildContext.Provider>
 
       <MembersDialog
@@ -719,6 +942,11 @@ export function OrgUnitsCanvas({ initialUnits, lookups, initialPositions }: {
         onDone={(next) => {
           setUnits(next);
           setMembersUnitId(null);
+        }}
+        onUnits={setUnits}
+        onOpenMembers={(u) => {
+          setDeactivating(null);
+          setMembersUnitId(u.Unit_ID);
         }}
       />
     </div>

@@ -3,8 +3,8 @@
 import { createContext, useContext } from "react";
 import {
   addMember, cancelMember, createCompanyUnit, createUnit, deactivateUnit, editMember, endMember,
-  loadUnitHistory, loadUserUnits, moveMember, publishDefaultLayout, replaceManager, saveUnitPositions, setManager, setParent,
-  setPrimary, updateUnit,
+  loadUnitHistory, loadUserUnits, moveMember, publishDefaultLayout, reactivateUnit, replaceManager, saveUnitPositions, setManager,
+  setParent, setPrimary, updateUnit,
 } from "@/app/c/admin/org-units/actions";
 
 /** ทุกอย่างที่ UI เรียก (Server Actions) — ผ่าน context เพื่อสลับตัวอื่นแทนได้ (เช่นตอนทดสอบ) */
@@ -16,6 +16,7 @@ export type OrgApi = {
   createCompanyUnit: typeof createCompanyUnit;
   updateUnit: typeof updateUnit;
   deactivateUnit: typeof deactivateUnit;
+  reactivateUnit: typeof reactivateUnit;
   addMember: typeof addMember;
   moveMember: typeof moveMember;
   setPrimary: typeof setPrimary;
@@ -29,7 +30,7 @@ export type OrgApi = {
 };
 
 export const serverApi: OrgApi = {
-  loadUnitHistory, loadUserUnits, setParent, createUnit, createCompanyUnit, updateUnit, deactivateUnit,
+  loadUnitHistory, loadUserUnits, setParent, createUnit, createCompanyUnit, updateUnit, deactivateUnit, reactivateUnit,
   addMember, moveMember, setPrimary, setManager, replaceManager, endMember, editMember, cancelMember,
   saveUnitPositions, publishDefaultLayout,
 };

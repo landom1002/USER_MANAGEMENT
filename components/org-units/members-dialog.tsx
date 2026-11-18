@@ -24,6 +24,9 @@ import { todayStr, useOrgRules, useRunAction } from "./shared";
 import { UnitHistoryLog, type CatFilter } from "./unit-history-log";
 import { UnitTitleFields, type UnitEditField } from "./unit-title-fields";
 
+/** คำสั่งของแถวสมาชิก (ไม่รวมเพิ่มคน / ช่วงว่าง) */
+type RowActionKind = Exclude<MemberAction["kind"], "add" | "assign">;
+
 type Props = {
   unit: OrgUnitRow | null;
   units: OrgUnitRow[];
@@ -103,16 +106,27 @@ function MembersBody({ unit, units, lookups, onUnits, onAddChild, onDeactivate }
   const warnings = rules.unitWarnings(unit, parent);
   const period = view === "year" ? sel.slice(0, 4) : view === "month" ? sel.slice(0, 7) : sel;
   const pick = (d: string) => setSel(start && d < start ? start : d > today ? today : d);
-  const onRowAction = (m: OrgMemberHistRow) => (kind: Exclude<MemberAction["kind"], "add">) =>
-    setAction({ kind, unit, member: m } as MemberAction);
+  // วันที่มีผลตั้งต้น = วันที่กำลังดูบนปฏิทิน
+  const onRowAction = (m: OrgMemberHistRow) => (kind: RowActionKind) =>
+    setAction({ kind, unit, member: m, date: sel });
 
-  // เปลี่ยนหัวหน้าด้วยการลากวาง — ทำได้เฉพาะตอนดูวันนี้ (วันที่มีผล = วันนี้)
+  // เปลี่ยนหัวหน้าด้วยการลากวาง
+  // - ดูวันนี้: บันทึกทันที (วันที่มีผล = วันนี้)
+  // - ดูย้อนหลัง: เปิดฟอร์มเลือกช่วง (ตั้งต้น = ช่วงหัวหน้าบนปฏิทินที่วันนั้นอยู่) ให้ตรวจก่อนบันทึก
   const isToday = sel === today;
+  const selPeriod = start ? periodAt(periods, sel) : null;
   const curMgr = active.find((r) => r.is_manager && coversDate(r, today)) ?? null;
   const { run, pending: swapping } = useRunAction(onUnits);
+  const assignIn = (p: MgrPeriod, memberId?: number, date?: string) =>
+    setAction({ kind: "assign", unit, start: p.start, end: p.end, vacant: p.vacant, memberId, date, until: date });
   const replaceWith = async (memberId: number) => {
     const m = active.find((r) => r.Member_ID === memberId);
-    if (!isToday || !m || m.is_manager || !coversDate(m, today)) return;
+    if (!m || m.is_manager || !coversDate(m, sel)) return;
+    if (!isToday) {
+      // ลากวาง: วันเริ่ม / วันจบตั้งต้น = วันที่เลือกบนปฏิทิน (แก้ช่วงในฟอร์มได้)
+      if (selPeriod) assignIn(selPeriod, memberId, sel);
+      return;
+    }
     const ok = await run(api.replaceManager({ memberId, date: today }), `ตั้ง ${m.Name ?? m.UserCode} เป็นหัวหน้าแทนแล้ว`);
     if (ok) reload();
   };
@@ -129,7 +143,7 @@ function MembersBody({ unit, units, lookups, onUnits, onAddChild, onDeactivate }
           editing={editing} onEditing={setEditing}
         />
         <div className="flex shrink-0 items-center gap-1.5">
-          <Button size="sm" onClick={() => setAction({ kind: "add", unit })}>
+          <Button size="sm" onClick={() => setAction({ kind: "add", unit, date: sel })}>
             <UserPlus /> เพิ่มคน
           </Button>
           <DropdownMenu>
@@ -206,8 +220,9 @@ function MembersBody({ unit, units, lookups, onUnits, onAddChild, onDeactivate }
             )}
 
             <ManagerCard
-              p={start ? periodAt(periods, sel) : null}
-              droppable={isToday && dragId != null}
+              p={selPeriod}
+              droppable={dragId != null && (isToday || selPeriod != null)}
+              confirm={!isToday}
               pending={swapping}
               onDrop={() => {
                 const id = dragId;
@@ -215,6 +230,7 @@ function MembersBody({ unit, units, lookups, onUnits, onAddChild, onDeactivate }
                 if (id != null) replaceWith(id);
               }}
               onRemove={isToday && curMgr ? () => setAction({ kind: "manager", unit, member: curMgr }) : undefined}
+              onFillGap={(p) => assignIn(p)}
             />
 
             <Segmented
@@ -230,7 +246,7 @@ function MembersBody({ unit, units, lookups, onUnits, onAddChild, onDeactivate }
             {side === "members" ? (
               <MembersAt
                 rows={active} sel={sel} today={today} periods={periods} onAction={onRowAction}
-                canDrag={isToday && !swapping} onDrag={setDragId}
+                canDrag={!swapping} onDrag={setDragId}
               />
             ) : (
               <UnitHistoryLog events={events} cat={cat} onCat={setCat} period={period} today={today} onPick={pick} />
@@ -268,14 +284,18 @@ function Avatar({ name, p, size = "sm" }: { name: string | null; p?: MgrPeriod |
   );
 }
 
-function ManagerCard({ p, droppable, pending, onDrop, onRemove }: {
+function ManagerCard({ p, droppable, confirm, pending, onDrop, onRemove, onFillGap }: {
   p: MgrPeriod | null;
-  /** กำลังลากสมาชิกอยู่ และดูวันนี้ -> รับการวางได้ */
+  /** กำลังลากสมาชิกอยู่ -> รับการวางได้ */
   droppable: boolean;
+  /** วางแล้วเปิดฟอร์มยืนยันช่วง (ดูย้อนหลัง) แทนการบันทึกทันที */
+  confirm: boolean;
   pending: boolean;
   onDrop: () => void;
   /** มี = แสดงปุ่มถอดหัวหน้าตอน hover (เฉพาะวันนี้ที่มีหัวหน้า) */
   onRemove?: () => void;
+  /** วันที่เลือกอยู่ในช่วงว่างหัวหน้า -> ปุ่มตั้งหัวหน้าให้ทั้งช่วง */
+  onFillGap: (p: MgrPeriod) => void;
 }) {
   const [over, setOver] = useState(false);
   const has = p && !p.vacant;
@@ -325,9 +345,15 @@ function ManagerCard({ p, droppable, pending, onDrop, onRemove }: {
           <UserX /> ถอดหัวหน้า
         </Button>
       )}
+      {p?.vacant && !droppable && !pending && (
+        <Button size="xs" variant="outline" className="shrink-0" onClick={() => onFillGap(p)}>
+          <Crown /> ตั้งหัวหน้าช่วงนี้
+        </Button>
+      )}
       {droppable && (
         <span className="pointer-events-none absolute inset-0 flex items-center justify-center rounded-xl bg-card/85 text-sm font-medium text-primary">
           <Crown className="mr-1.5 size-4" /> วางเพื่อตั้งเป็นหัวหน้า{has ? "แทน" : ""}
+          {confirm && p && <span className="ml-1 font-normal">· เลือกช่วง {fmtRange(p.start, p.end)}</span>}
         </span>
       )}
       {pending && (
@@ -344,7 +370,7 @@ function MembersAt({ rows, sel, today, periods, onAction, canDrag, onDrag }: {
   sel: string;
   today: string;
   periods: MgrPeriod[];
-  onAction: (m: OrgMemberHistRow) => (kind: Exclude<MemberAction["kind"], "add">) => void;
+  onAction: (m: OrgMemberHistRow) => (kind: RowActionKind) => void;
   /** ลากสมาชิก (ที่ไม่ใช่หัวหน้า) ไปวางบนการ์ดหัวหน้าได้ */
   canDrag: boolean;
   onDrag: (memberId: number | null) => void;
@@ -354,6 +380,12 @@ function MembersAt({ rows, sel, today, periods, onAction, canDrag, onDrag }: {
   const at = rows.filter((r) => coversDate(r, sel)).sort(sort);
   const upcoming = sel === today ? rows.filter((r) => r.start_date && r.start_date > today).sort(sort) : [];
   const mgrPeriod = periodAt(periods, sel);
+  // แถวที่คลิกเลือกไว้ — กด Delete เพื่อเปิดยืนยัน "ให้ออกจากห้อง"
+  const [picked, setPicked] = useState<number | null>(null);
+  const rowSel = (m: OrgMemberHistRow) => ({
+    selected: picked === m.Member_ID,
+    onSelect: () => setPicked((id) => (id === m.Member_ID ? null : m.Member_ID)),
+  });
 
   return (
     <div className="flex flex-col gap-3">
@@ -366,7 +398,7 @@ function MembersAt({ rows, sel, today, periods, onAction, canDrag, onDrag }: {
           {at.map((m) => (
             <MemberRow
               key={m.Member_ID} m={m} today={today} p={m.is_manager ? mgrPeriod : null} onAction={onAction(m)}
-              draggable={canDrag && !m.is_manager} gutter={canDrag} onDrag={onDrag}
+              draggable={canDrag && !m.is_manager} gutter={canDrag} onDrag={onDrag} {...rowSel(m)}
             />
           ))}
         </ul>
@@ -378,7 +410,7 @@ function MembersAt({ rows, sel, today, periods, onAction, canDrag, onDrag }: {
           </span>
           <ul className="divide-y overflow-hidden rounded-lg border border-dashed bg-card">
             {upcoming.map((m) => (
-              <MemberRow key={m.Member_ID} m={m} today={today} p={null} onAction={onAction(m)} />
+              <MemberRow key={m.Member_ID} m={m} today={today} p={null} onAction={onAction(m)} {...rowSel(m)} />
             ))}
           </ul>
         </section>
@@ -387,15 +419,17 @@ function MembersAt({ rows, sel, today, periods, onAction, canDrag, onDrag }: {
   );
 }
 
-function MemberRow({ m, today, p, onAction, draggable = false, gutter = false, onDrag }: {
+function MemberRow({ m, today, p, onAction, draggable = false, gutter = false, onDrag, selected = false, onSelect }: {
   m: OrgMemberHistRow;
   today: string;
   p: MgrPeriod | null;
-  onAction: (kind: Exclude<MemberAction["kind"], "add">) => void;
+  onAction: (kind: RowActionKind) => void;
   draggable?: boolean;
   /** แสดงคอลัมน์ที่จับลากหน้า avatar */
   gutter?: boolean;
   onDrag?: (memberId: number | null) => void;
+  selected?: boolean;
+  onSelect?: () => void;
 }) {
   const past = Boolean(m.end_date && m.end_date < today);
   const future = Boolean(m.start_date && m.start_date > today);
@@ -408,7 +442,28 @@ function MemberRow({ m, today, p, onAction, draggable = false, gutter = false, o
         : { label: "ยังอยู่", cls: "border-transparent bg-muted" };
   return (
     <li
-      className={cn("flex items-center gap-2.5 py-2 pr-1.5 pl-2.5", draggable && "cursor-grab hover:bg-muted/40 active:cursor-grabbing")}
+      className={cn(
+        "flex cursor-pointer items-center gap-2.5 py-2 pr-1.5 pl-2.5 outline-none hover:bg-muted/40 focus-visible:bg-muted/40",
+        draggable && "cursor-grab active:cursor-grabbing",
+        selected && "bg-primary/5 ring-2 ring-primary ring-inset hover:bg-primary/5",
+      )}
+      tabIndex={0}
+      aria-selected={selected}
+      onClick={(e) => {
+        // คลิกปุ่ม "..." / เมนู ไม่นับเป็นการเลือกแถว
+        if ((e.target as HTMLElement).closest("button, [role=menu]")) return;
+        onSelect?.();
+      }}
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect?.();
+        } else if (selected && (e.key === "Delete" || e.key === "Backspace") && !past) {
+          e.preventDefault();
+          onAction("end");
+        }
+      }}
       draggable={draggable}
       onDragStart={draggable ? (e) => {
         e.dataTransfer.effectAllowed = "move";
@@ -453,15 +508,16 @@ function MemberRow({ m, today, p, onAction, draggable = false, gutter = false, o
                   <Star /> ตั้งเป็นห้องหลัก
                 </DropdownMenuItem>
               )}
-              <DropdownMenuItem onSelect={() => onAction("manager")}>
-                {m.is_manager ? <><UserX /> ถอดหัวหน้า</> : <><Crown /> ตั้งเป็นหัวหน้า</>}
-              </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => onAction("end")}>
                 <LogOut /> ให้ออกจากห้อง
               </DropdownMenuItem>
-              <DropdownMenuSeparator />
             </>
           )}
+          {/* ตั้ง / ถอดหัวหน้าได้ทั้งแถวในอดีต (ย้อนหลังเป็นช่วง) */}
+          <DropdownMenuItem onSelect={() => onAction("manager")}>
+            {m.is_manager ? <><UserX /> ถอดหัวหน้า</> : <><Crown /> ตั้งเป็นหัวหน้า</>}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem onSelect={() => onAction("edit")}>
             <Pencil /> แก้ไขข้อมูล (กรอกผิด)
           </DropdownMenuItem>

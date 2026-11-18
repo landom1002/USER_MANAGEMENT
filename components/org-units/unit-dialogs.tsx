@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { ArrowRight, Loader2, TriangleAlert } from "lucide-react";
+import { ArrowRight, Loader2, TriangleAlert, Undo2, Users } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -251,12 +252,76 @@ function UnitForm({ state, lookups, onClose, onUnits }: {
 
 // ---------------------------------------------------------------- ปิดห้อง
 
-export function DeactivateUnitDialog({ unit, childCount, onClose, onDone }: {
-  unit: OrgUnitRow | null; childCount: number; onClose: () => void; onDone: (u: OrgUnitRow[]) => void;
+const UNDO_MS = 10_000;
+
+/**
+ * ปิดห้อง (Actived = 0) — ห้ามปิดห้องบริษัท / ห้องที่มีห้องลูก / ห้องที่มีคน (ห้องที่มีคน -> ปุ่มไปเปิดรายชื่อสมาชิก)
+ * ปิดสำเร็จ -> toast มีปุ่ม "เลิกทำ" (เรียก reactivateUnit) ภายใน 10 วินาที
+ */
+export function DeactivateUnitDialog({ unit, childCount, onClose, onDone, onUnits, onOpenMembers }: {
+  unit: OrgUnitRow | null;
+  childCount: number;
+  onClose: () => void;
+  /** ปิดห้องสำเร็จ — units ใหม่ */
+  onDone: (u: OrgUnitRow[]) => void;
+  /** units ใหม่หลังเลิกทำ (เปิดห้องกลับ) */
+  onUnits: (u: OrgUnitRow[]) => void;
+  /** ห้องยังมีคน -> ไปจัดการคนในรายชื่อสมาชิก */
+  onOpenMembers?: (u: OrgUnitRow) => void;
 }) {
   const api = useOrgApi();
-  const { run, pending } = useRunAction(onDone);
-  const blocked = unit ? unit.unit_type === "COMPANY" || childCount > 0 : true;
+  const [pending, setPending] = useState(false);
+  const people = unit?.members ?? 0;
+  const reason = !unit
+    ? null
+    : unit.unit_type === "COMPANY"
+      ? "ปิดห้องระดับบริษัทไม่ได้"
+      : childCount > 0
+        ? `ยังมีห้องลูก ${childCount} ห้อง — ย้ายห้องลูกก่อน`
+        : people > 0
+          ? `ยังมีคนในห้อง ${people.toLocaleString("th-TH")} คน — ย้ายคนหรือให้ออกก่อน`
+          : null;
+  const blocked = !unit || reason != null;
+  const hasPeople = Boolean(unit) && unit!.unit_type !== "COMPANY" && childCount === 0 && people > 0;
+
+  const reopen = async (u: OrgUnitRow) => {
+    try {
+      const r = await api.reactivateUnit({ unitId: u.Unit_ID });
+      if (!r.ok) return void toast.error(r.error);
+      onUnits(r.data);
+      toast.success(`เปิดห้อง ${u.unit_code} กลับแล้ว`);
+    } catch {
+      toast.error("เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง");
+    }
+  };
+
+  const deactivate = async () => {
+    if (!unit) return;
+    const u = unit;
+    setPending(true);
+    try {
+      const r = await api.deactivateUnit({ unitId: u.Unit_ID });
+      if (!r.ok) return void toast.error(r.error);
+      onDone(r.data);
+      onClose();
+      toast.success(`ปิดห้อง ${u.unit_code} แล้ว`, {
+        duration: UNDO_MS,
+        action: {
+          label: (
+            <span className="flex items-center gap-1">
+              <Undo2 className="size-3.5" /> เลิกทำ
+            </span>
+          ),
+          onClick: () => void reopen(u),
+        },
+      });
+    } catch {
+      toast.error("เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาลองใหม่อีกครั้ง");
+    } finally {
+      setPending(false);
+    }
+  };
+
   return (
     <Dialog open={Boolean(unit)} onOpenChange={(o) => !o && !pending && onClose()}>
       <DialogContent className="sm:max-w-sm">
@@ -268,26 +333,24 @@ export function DeactivateUnitDialog({ unit, childCount, onClose, onDone }: {
           <AppAlert
             tone={blocked ? "destructive" : "warning"}
             icon={<TriangleAlert />}
-            title={
-              unit.unit_type === "COMPANY"
-                ? "ปิดห้องระดับบริษัทไม่ได้"
-                : childCount > 0
-                  ? `ยังมีห้องลูก ${childCount} ห้อง — ย้ายห้องลูกก่อน`
-                  : "ห้องจะหายจากผัง (ไม่ลบข้อมูล)"
+            title={reason ?? "ห้องจะหายจากผัง (ไม่ลบข้อมูล)"}
+            description={
+              !blocked
+                ? "ระบบจะตรวจคนที่ตั้งไว้ล่วงหน้าอีกครั้งตอนบันทึก · ปิดแล้วกด \"เลิกทำ\" ได้ภายใน 10 วินาที"
+                : undefined
             }
-            description={!blocked ? "ปิดได้เฉพาะห้องที่ไม่มีคน (รวมที่ตั้งไว้ล่วงหน้า) — ระบบจะตรวจอีกครั้งตอนบันทึก" : undefined}
           />
         )}
-        <Footer
-          onCancel={onClose}
-          pending={pending}
-          disabled={blocked}
-          destructive
-          okText="ปิดห้อง"
-          onOk={async () => {
-            if (unit && (await run(api.deactivateUnit({ unitId: unit.Unit_ID }), `ปิดห้อง ${unit.unit_code} แล้ว`))) onClose();
-          }}
-        />
+        {hasPeople && onOpenMembers ? (
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" onClick={onClose}>ยกเลิก</Button>
+            <Button onClick={() => unit && onOpenMembers(unit)}>
+              <Users className="size-4" /> เปิดรายชื่อสมาชิก
+            </Button>
+          </div>
+        ) : (
+          <Footer onCancel={onClose} pending={pending} disabled={blocked} destructive okText="ปิดห้อง" onOk={deactivate} />
+        )}
       </DialogContent>
     </Dialog>
   );
